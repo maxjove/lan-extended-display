@@ -13,7 +13,9 @@
 #else
 #include <arpa/inet.h>
 #include <cerrno>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -21,6 +23,8 @@
 namespace led::transport {
 
 namespace {
+
+constexpr int kConnectTimeoutMs = 1000;
 
 #if defined(_WIN32)
 using Socklen = int;
@@ -55,6 +59,14 @@ std::string lastSocketError(const char* operation) {
 }
 #endif
 
+std::string socketErrorCodeToString(const char* operation, int error) {
+#if defined(_WIN32)
+    return std::string(operation) + " failed with WSA error " + std::to_string(error);
+#else
+    return std::string(operation) + " failed: " + std::strerror(error);
+#endif
+}
+
 Status fillSockaddr(const UdpEndpoint& endpoint, sockaddr_in& address) {
     std::memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
@@ -81,6 +93,89 @@ void closeNativeSocket(std::uintptr_t socket) {
 #else
 void closeNativeSocket(int socket) {
     ::close(socket);
+}
+#endif
+
+#if defined(_WIN32)
+Status setSocketBlocking(SOCKET socket, bool blocking) {
+    u_long nonBlocking = blocking ? 0 : 1;
+    if (ioctlsocket(socket, FIONBIO, &nonBlocking) != 0) {
+        return Status::unavailable(lastSocketError("ioctlsocket"));
+    }
+    return Status::ok();
+}
+
+Status waitForConnectCompletion(SOCKET socket, int timeoutMs) {
+    fd_set writeSet;
+    FD_ZERO(&writeSet);
+    FD_SET(socket, &writeSet);
+    fd_set errorSet;
+    FD_ZERO(&errorSet);
+    FD_SET(socket, &errorSet);
+    timeval timeout{};
+    timeout.tv_sec = timeoutMs / 1000;
+    timeout.tv_usec = (timeoutMs % 1000) * 1000;
+
+    const int ready = select(0, nullptr, &writeSet, &errorSet, &timeout);
+    if (ready == 0) {
+        return Status::unavailable("connect timed out");
+    }
+    if (ready < 0) {
+        return Status::unavailable(lastSocketError("select"));
+    }
+
+    int socketError = 0;
+    Socklen socketErrorLength = sizeof(socketError);
+    if (getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&socketError), &socketErrorLength) != 0) {
+        return Status::unavailable(lastSocketError("getsockopt"));
+    }
+    if (socketError != 0) {
+        return Status::unavailable(socketErrorCodeToString("connect", socketError));
+    }
+    return Status::ok();
+}
+#else
+Status setSocketBlocking(int socket, bool blocking, int originalFlags) {
+    int flags = originalFlags;
+    if (blocking) {
+        flags &= ~O_NONBLOCK;
+    } else {
+        flags |= O_NONBLOCK;
+    }
+    if (fcntl(socket, F_SETFL, flags) != 0) {
+        return Status::unavailable(lastSocketError("fcntl"));
+    }
+    return Status::ok();
+}
+
+Status waitForConnectCompletion(int socket, int timeoutMs) {
+    fd_set writeSet;
+    FD_ZERO(&writeSet);
+    FD_SET(socket, &writeSet);
+    fd_set errorSet;
+    FD_ZERO(&errorSet);
+    FD_SET(socket, &errorSet);
+    timeval timeout{};
+    timeout.tv_sec = timeoutMs / 1000;
+    timeout.tv_usec = (timeoutMs % 1000) * 1000;
+
+    const int ready = select(socket + 1, nullptr, &writeSet, &errorSet, &timeout);
+    if (ready == 0) {
+        return Status::unavailable("connect timed out");
+    }
+    if (ready < 0) {
+        return Status::unavailable(lastSocketError("select"));
+    }
+
+    int socketError = 0;
+    Socklen socketErrorLength = sizeof(socketError);
+    if (getsockopt(socket, SOL_SOCKET, SO_ERROR, &socketError, &socketErrorLength) != 0) {
+        return Status::unavailable(lastSocketError("getsockopt"));
+    }
+    if (socketError != 0) {
+        return Status::unavailable(socketErrorCodeToString("connect", socketError));
+    }
+    return Status::ok();
 }
 #endif
 
@@ -132,11 +227,66 @@ Status TcpStream::connect(const UdpEndpoint& endpoint) {
         return status;
     }
 
+#if defined(_WIN32)
+    status = setSocketBlocking(nativeSocket, false);
+    if (!status.isOk()) {
+        close();
+        return status;
+    }
+
     if (::connect(nativeSocket, reinterpret_cast<sockaddr*>(&target), sizeof(target)) != 0) {
-        const auto error = lastSocketError("connect");
+        const int connectError = WSAGetLastError();
+        if (connectError != WSAEWOULDBLOCK && connectError != WSAEINPROGRESS && connectError != WSAEINVAL) {
+            const auto error = socketErrorCodeToString("connect", connectError);
+            close();
+            return Status::unavailable(error);
+        }
+        status = waitForConnectCompletion(nativeSocket, kConnectTimeoutMs);
+        if (!status.isOk()) {
+            close();
+            return status;
+        }
+    }
+
+    status = setSocketBlocking(nativeSocket, true);
+    if (!status.isOk()) {
+        close();
+        return status;
+    }
+#else
+    const int originalFlags = fcntl(nativeSocket, F_GETFL, 0);
+    if (originalFlags < 0) {
+        const auto error = lastSocketError("fcntl");
         close();
         return Status::unavailable(error);
     }
+
+    status = setSocketBlocking(nativeSocket, false, originalFlags);
+    if (!status.isOk()) {
+        close();
+        return status;
+    }
+
+    if (::connect(nativeSocket, reinterpret_cast<sockaddr*>(&target), sizeof(target)) != 0) {
+        const int connectError = errno;
+        if (connectError != EINPROGRESS) {
+            const auto error = socketErrorCodeToString("connect", connectError);
+            close();
+            return Status::unavailable(error);
+        }
+        status = waitForConnectCompletion(nativeSocket, kConnectTimeoutMs);
+        if (!status.isOk()) {
+            close();
+            return status;
+        }
+    }
+
+    status = setSocketBlocking(nativeSocket, true, originalFlags);
+    if (!status.isOk()) {
+        close();
+        return status;
+    }
+#endif
     peerEndpoint_ = endpoint;
     return Status::ok();
 }
@@ -264,6 +414,31 @@ Status TcpListener::bindAndListen(std::uint16_t port, const std::string& address
     } else {
         localPort_ = port;
     }
+    return Status::ok();
+}
+
+Status TcpListener::setAcceptTimeoutMs(int timeoutMs) {
+    if (!isOpen()) {
+        return Status::invalidState("cannot set accept timeout on a closed TCP listener");
+    }
+    if (timeoutMs < 0) {
+        return Status::invalidArgument("accept timeout must be non-negative");
+    }
+
+#if defined(_WIN32)
+    const auto nativeSocket = static_cast<SOCKET>(socket_);
+    DWORD timeout = static_cast<DWORD>(timeoutMs);
+    if (setsockopt(nativeSocket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout)) != 0) {
+        return Status::unavailable(lastSocketError("setsockopt"));
+    }
+#else
+    timeval timeout{};
+    timeout.tv_sec = timeoutMs / 1000;
+    timeout.tv_usec = (timeoutMs % 1000) * 1000;
+    if (setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+        return Status::unavailable(lastSocketError("setsockopt"));
+    }
+#endif
     return Status::ok();
 }
 

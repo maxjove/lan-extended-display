@@ -53,6 +53,7 @@ public:
     TcpListener& operator=(const TcpListener&) = delete;
 
     Status bindAndListen(std::uint16_t port, const std::string& address = "0.0.0.0", int backlog = 1);
+    Status setAcceptTimeoutMs(int timeoutMs);
     Status accept(TcpStream& stream) const;
     void close();
 

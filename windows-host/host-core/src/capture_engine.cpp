@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <utility>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -245,15 +246,31 @@ void stopDxgiCapture(CaptureEngine& engine) {
 }
 
 Status startGdiCapture(CaptureEngine& engine, const protocol::Resolution& resolution) {
-    engine.screenDc_ = GetDC(nullptr);
+    if (!engine.sourceDeviceName_.empty()) {
+        engine.screenDc_ = CreateDCA("DISPLAY", engine.sourceDeviceName_.c_str(), nullptr, nullptr);
+        engine.screenDcCreated_ = true;
+        if (engine.screenDc_ == nullptr) {
+            logWarn("GDI display DC unavailable for " + engine.sourceDeviceName_ + ", falling back to desktop DC");
+            engine.screenDc_ = GetDC(nullptr);
+            engine.screenDcCreated_ = false;
+        }
+    } else {
+        engine.screenDc_ = GetDC(nullptr);
+        engine.screenDcCreated_ = false;
+    }
     if (engine.screenDc_ == nullptr) {
         return Status::unavailable("failed to acquire screen DC");
     }
 
     engine.memoryDc_ = CreateCompatibleDC(static_cast<HDC>(engine.screenDc_));
     if (engine.memoryDc_ == nullptr) {
-        ReleaseDC(nullptr, static_cast<HDC>(engine.screenDc_));
+        if (engine.screenDcCreated_) {
+            DeleteDC(static_cast<HDC>(engine.screenDc_));
+        } else {
+            ReleaseDC(nullptr, static_cast<HDC>(engine.screenDc_));
+        }
         engine.screenDc_ = nullptr;
+        engine.screenDcCreated_ = false;
         return Status::unavailable("failed to create capture memory DC");
     }
 
@@ -274,9 +291,14 @@ Status startGdiCapture(CaptureEngine& engine, const protocol::Resolution& resolu
         0);
     if (engine.bitmap_ == nullptr || engine.bitmapBits_ == nullptr) {
         DeleteDC(static_cast<HDC>(engine.memoryDc_));
-        ReleaseDC(nullptr, static_cast<HDC>(engine.screenDc_));
+        if (engine.screenDcCreated_) {
+            DeleteDC(static_cast<HDC>(engine.screenDc_));
+        } else {
+            ReleaseDC(nullptr, static_cast<HDC>(engine.screenDc_));
+        }
         engine.memoryDc_ = nullptr;
         engine.screenDc_ = nullptr;
+        engine.screenDcCreated_ = false;
         engine.bitmapBits_ = nullptr;
         return Status::unavailable("failed to create capture DIB section");
     }
@@ -297,9 +319,48 @@ void stopGdiCapture(CaptureEngine& engine) {
         engine.memoryDc_ = nullptr;
     }
     if (engine.screenDc_ != nullptr) {
-        ReleaseDC(nullptr, static_cast<HDC>(engine.screenDc_));
+        if (engine.screenDcCreated_) {
+            DeleteDC(static_cast<HDC>(engine.screenDc_));
+        } else {
+            ReleaseDC(nullptr, static_cast<HDC>(engine.screenDc_));
+        }
         engine.screenDc_ = nullptr;
+        engine.screenDcCreated_ = false;
     }
+}
+
+Status captureGdiFrame(CaptureEngine& engine, CapturedFrame& frame) {
+    if (engine.screenDc_ == nullptr || engine.memoryDc_ == nullptr || engine.bitmapBits_ == nullptr) {
+        return Status::invalidState("GDI capture backend is not initialized");
+    }
+
+    const bool displayDcCapture = !engine.sourceDeviceName_.empty() && engine.screenDcCreated_;
+    const auto sourceX = displayDcCapture ? 0 : (engine.captureRegion_ ? engine.sourceOriginX_ : GetSystemMetrics(SM_XVIRTUALSCREEN));
+    const auto sourceY = displayDcCapture ? 0 : (engine.captureRegion_ ? engine.sourceOriginY_ : GetSystemMetrics(SM_YVIRTUALSCREEN));
+    const auto sourceWidth = engine.captureRegion_ ? static_cast<int>(engine.sourceWidth_) : std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
+    const auto sourceHeight = engine.captureRegion_ ? static_cast<int>(engine.sourceHeight_) : std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
+
+    const BOOL copied = StretchBlt(
+        static_cast<HDC>(engine.memoryDc_),
+        0,
+        0,
+        static_cast<int>(frame.width),
+        static_cast<int>(frame.height),
+        static_cast<HDC>(engine.screenDc_),
+        sourceX,
+        sourceY,
+        sourceWidth,
+        sourceHeight,
+        SRCCOPY | CAPTUREBLT);
+    if (!copied) {
+        return Status::unavailable("GDI desktop capture failed");
+    }
+
+    const auto byteCount = static_cast<std::size_t>(frame.width) * frame.height * 4;
+    frame.bgra.resize(byteCount);
+    std::memcpy(frame.bgra.data(), engine.bitmapBits_, byteCount);
+    engine.capturedRealFrame_ = true;
+    return Status::ok();
 }
 
 Status captureDxgiFrame(CaptureEngine& engine, CapturedFrame& frame) {
@@ -314,8 +375,20 @@ Status captureDxgiFrame(CaptureEngine& engine, CapturedFrame& frame) {
     IDXGIResource* desktopResource = nullptr;
     HRESULT hr = duplication->AcquireNextFrame(1, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        if (!engine.capturedRealFrame_) {
+            if (engine.memoryDc_ == nullptr) {
+                auto gdiStatus = startGdiCapture(engine, protocol::Resolution{frame.width, frame.height, 0});
+                if (!gdiStatus.isOk()) {
+                    return gdiStatus;
+                }
+            }
+            return captureGdiFrame(engine, frame);
+        }
         frame = engine.latestFrame_;
         return Status::ok();
+    }
+    if (hr == DXGI_ERROR_ACCESS_LOST) {
+        return Status::unavailable("DXGI_ACCESS_LOST");
     }
     if (FAILED(hr)) {
         return Status::unavailable(hresultText(hr, "AcquireNextFrame"));
@@ -349,6 +422,7 @@ Status captureDxgiFrame(CaptureEngine& engine, CapturedFrame& frame) {
 
     context->Unmap(stagingTexture, 0);
     duplication->ReleaseFrame();
+    engine.capturedRealFrame_ = true;
     return Status::ok();
 }
 
@@ -357,15 +431,17 @@ Status captureDxgiFrame(CaptureEngine& engine, CapturedFrame& frame) {
 
 namespace {
 
-Status startCapture(CaptureEngine& engine, const protocol::Resolution& resolution, bool captureRegion, int originX, int originY) {
+Status startCapture(CaptureEngine& engine, const protocol::Resolution& resolution, bool captureRegion, int originX, int originY, std::string deviceName) {
     if (resolution.width == 0 || resolution.height == 0) {
         return Status::invalidArgument("capture resolution must be non-zero");
     }
 
     engine.running_ = true;
     engine.captureRegion_ = captureRegion;
+    engine.capturedRealFrame_ = false;
     engine.sourceOriginX_ = originX;
     engine.sourceOriginY_ = originY;
+    engine.sourceDeviceName_ = std::move(deviceName);
     engine.sourceWidth_ = resolution.width;
     engine.sourceHeight_ = resolution.height;
     engine.latestFrame_ = CapturedFrame{};
@@ -396,11 +472,11 @@ Status startCapture(CaptureEngine& engine, const protocol::Resolution& resolutio
 }  // namespace
 
 Status CaptureEngine::start(const protocol::Resolution& resolution) {
-    return startCapture(*this, resolution, false, 0, 0);
+    return startCapture(*this, resolution, false, 0, 0, {});
 }
 
-Status CaptureEngine::startRegion(const protocol::Resolution& resolution, int originX, int originY) {
-    return startCapture(*this, resolution, true, originX, originY);
+Status CaptureEngine::startRegion(const protocol::Resolution& resolution, int originX, int originY, std::string deviceName) {
+    return startCapture(*this, resolution, true, originX, originY, std::move(deviceName));
 }
 
 Status CaptureEngine::captureNextFrame(CapturedFrame& frame) {
@@ -417,8 +493,25 @@ Status CaptureEngine::captureNextFrame(CapturedFrame& frame) {
     if (dxgiCapture_) {
         auto status = captureDxgiFrame(*this, latestFrame_);
         if (!status.isOk()) {
+            logWarn("DXGI capture failed, trying to reinitialize Desktop Duplication: " + status.message());
+            const auto restartOriginX = sourceOriginX_;
+            const auto restartOriginY = sourceOriginY_;
             stopDxgiCapture(*this);
-            logWarn("DXGI capture failed, switching to GDI capture for later frames: " + status.message());
+            auto restartStatus = startDxgiCapture(
+                *this,
+                protocol::Resolution{latestFrame_.width, latestFrame_.height, 0},
+                captureRegion_,
+                restartOriginX,
+                restartOriginY);
+            if (restartStatus.isOk()) {
+                status = captureDxgiFrame(*this, latestFrame_);
+                if (status.isOk()) {
+                    frame = latestFrame_;
+                    return Status::ok();
+                }
+            }
+            const auto dxgiFailure = restartStatus.isOk() ? status.message() : restartStatus.message();
+            logWarn("DXGI reinitialize failed, switching to GDI capture: " + dxgiFailure);
             auto gdiStatus = startGdiCapture(*this, protocol::Resolution{
                 latestFrame_.width,
                 latestFrame_.height,
@@ -434,30 +527,10 @@ Status CaptureEngine::captureNextFrame(CapturedFrame& frame) {
         }
     }
 
-    const auto sourceX = captureRegion_ ? sourceOriginX_ : GetSystemMetrics(SM_XVIRTUALSCREEN);
-    const auto sourceY = captureRegion_ ? sourceOriginY_ : GetSystemMetrics(SM_YVIRTUALSCREEN);
-    const auto sourceWidth = captureRegion_ ? static_cast<int>(sourceWidth_) : std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
-    const auto sourceHeight = captureRegion_ ? static_cast<int>(sourceHeight_) : std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
-
-    const BOOL copied = StretchBlt(
-        static_cast<HDC>(memoryDc_),
-        0,
-        0,
-        static_cast<int>(latestFrame_.width),
-        static_cast<int>(latestFrame_.height),
-        static_cast<HDC>(screenDc_),
-        sourceX,
-        sourceY,
-        sourceWidth,
-        sourceHeight,
-        SRCCOPY | CAPTUREBLT);
-    if (!copied) {
-        return Status::unavailable("GDI desktop capture failed");
+    auto gdiStatus = captureGdiFrame(*this, latestFrame_);
+    if (!gdiStatus.isOk()) {
+        return gdiStatus;
     }
-
-    const auto byteCount = static_cast<std::size_t>(latestFrame_.width) * latestFrame_.height * 4;
-    latestFrame_.bgra.resize(byteCount);
-    std::memcpy(latestFrame_.bgra.data(), bitmapBits_, byteCount);
 #endif
 
     frame = latestFrame_;

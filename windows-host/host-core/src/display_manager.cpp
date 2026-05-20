@@ -23,6 +23,42 @@ namespace led::host {
 #if defined(_WIN32)
 namespace {
 
+bool textContains(const std::string& text, const char* needle) {
+    return text.find(needle) != std::string::npos;
+}
+
+bool isLedVirtualDisplayDevice(const char* deviceName) {
+    DISPLAY_DEVICEA adapter{};
+    adapter.cb = sizeof(adapter);
+    if (EnumDisplayDevicesA(deviceName, 0, &adapter, 0)) {
+        const std::string text =
+            std::string(adapter.DeviceName) + " " +
+            adapter.DeviceString + " " +
+            adapter.DeviceID + " " +
+            adapter.DeviceKey;
+        if (textContains(text, "LED LAN Virtual Display") || textContains(text, "ROOT\\DISPLAY")) {
+            return textContains(text, "LED LAN Virtual Display");
+        }
+    }
+
+    for (DWORD index = 0;; ++index) {
+        DISPLAY_DEVICEA display{};
+        display.cb = sizeof(display);
+        if (!EnumDisplayDevicesA(nullptr, index, &display, 0)) {
+            break;
+        }
+        if (std::string(display.DeviceName) != deviceName) {
+            continue;
+        }
+        const std::string text =
+            std::string(display.DeviceString) + " " +
+            display.DeviceID + " " +
+            display.DeviceKey;
+        return textContains(text, "LED LAN Virtual Display");
+    }
+    return false;
+}
+
 BOOL CALLBACK collectMonitorInfo(HMONITOR monitor, HDC, LPRECT, LPARAM userData) {
     auto* displays = reinterpret_cast<std::vector<PhysicalDisplayInfo>*>(userData);
     MONITORINFOEXA info{};
@@ -40,6 +76,7 @@ BOOL CALLBACK collectMonitorInfo(HMONITOR monitor, HDC, LPRECT, LPARAM userData)
         static_cast<std::uint32_t>(width),
         static_cast<std::uint32_t>(height),
         (info.dwFlags & MONITORINFOF_PRIMARY) != 0,
+        isLedVirtualDisplayDevice(info.szDevice),
     });
     return TRUE;
 }
@@ -48,11 +85,11 @@ BOOL CALLBACK collectMonitorInfo(HMONITOR monitor, HDC, LPRECT, LPARAM userData)
 #endif
 
 Status DisplayManager::createVirtualDisplay(const protocol::Resolution& resolution) {
-    for (int attempt = 0; attempt < 20; ++attempt) {
+    for (int attempt = 0; attempt < 50; ++attempt) {
         const auto displays = enumerateDisplays();
         auto best = displays.end();
         for (auto it = displays.begin(); it != displays.end(); ++it) {
-            if (it->primary || it->width != resolution.width || it->height != resolution.height) {
+            if (!it->ledVirtual || it->primary || it->width != resolution.width || it->height != resolution.height) {
                 continue;
             }
             if (best == displays.end() || it->originX > best->originX ||
@@ -78,19 +115,8 @@ Status DisplayManager::createVirtualDisplay(const protocol::Resolution& resoluti
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    const auto bounds = currentDesktopBounds();
-    virtualDisplay_.deviceName = "placeholder";
-    virtualDisplay_.resolution = resolution;
-    virtualDisplay_.originX = bounds.left + bounds.width;
-    virtualDisplay_.originY = bounds.top;
-    virtualDisplay_.dpiScale = 1.0;
-    virtualDisplay_.active = true;
-    logInfo(
-        "host virtual display placeholder activated at " +
-        std::to_string(virtualDisplay_.originX) + "," +
-        std::to_string(virtualDisplay_.originY) +
-        "; LED IddCx monitor was not found");
-    return Status::ok();
+    return Status::unavailable(
+        "LED IddCx virtual monitor was not found in the active Windows display topology");
 }
 
 Status DisplayManager::destroyVirtualDisplay() {
@@ -126,7 +152,7 @@ std::vector<PhysicalDisplayInfo> DisplayManager::enumerateDisplays() {
 #if defined(_WIN32)
     EnumDisplayMonitors(nullptr, nullptr, collectMonitorInfo, reinterpret_cast<LPARAM>(&displays));
 #else
-    displays.push_back(PhysicalDisplayInfo{"fallback", 0, 0, 1920, 1080, true});
+    displays.push_back(PhysicalDisplayInfo{"fallback", 0, 0, 1920, 1080, true, false});
 #endif
     return displays;
 }

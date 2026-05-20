@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace led::host {
@@ -20,7 +21,7 @@ struct CapturedFrame {
 class CaptureEngine {
 public:
     Status start(const protocol::Resolution& resolution);
-    Status startRegion(const protocol::Resolution& resolution, int originX, int originY);
+    Status startRegion(const protocol::Resolution& resolution, int originX, int originY, std::string deviceName = {});
     Status captureNextFrame(CapturedFrame& frame);
     Status stop();
 
@@ -31,9 +32,11 @@ public:
     // Internal backend state. Kept here so platform-specific capture helpers can stay out of the public methods.
     bool running_{false};
     bool dxgiCapture_{false};
+    bool capturedRealFrame_{false};
     CapturedFrame latestFrame_{};
     std::chrono::steady_clock::time_point startTime_{};
     void* screenDc_{nullptr};
+    bool screenDcCreated_{false};
     void* memoryDc_{nullptr};
     void* bitmap_{nullptr};
     void* bitmapBits_{nullptr};
@@ -45,6 +48,7 @@ public:
     std::uint32_t sourceHeight_{0};
     int sourceOriginX_{0};
     int sourceOriginY_{0};
+    std::string sourceDeviceName_{};
     bool captureRegion_{false};
 };
 
