@@ -14,6 +14,7 @@
 
 - `lan-extended-display-implementation-plan.md`
 - `docs/development-checklist.md`
+- `docs/gui-and-autostart.md`
 
 ## 当前代码结构
 

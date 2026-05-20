@@ -20,7 +20,36 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace {
+
+constexpr const char* kLiveCaptureStopEventName = "Local\\LanExtendedDisplayHostStop";
+#if defined(_WIN32)
+constexpr const wchar_t* kDriverCreateMonitorEventName = L"Global\\LanExtendedDisplayCreateMonitor";
+#endif
+
+bool signalDriverCreateMonitor() {
+#if defined(_WIN32)
+    HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, kDriverCreateMonitorEventName);
+    if (event == nullptr) {
+        return false;
+    }
+    const BOOL ok = SetEvent(event);
+    CloseHandle(event);
+    return ok != FALSE;
+#else
+    return false;
+#endif
+}
 
 std::uint16_t parsePort(const char* value, std::uint16_t fallback) {
     try {
@@ -32,6 +61,41 @@ std::uint16_t parsePort(const char* value, std::uint16_t fallback) {
     }
     return fallback;
 }
+
+#if defined(_WIN32)
+struct LiveCaptureStopEvent {
+    HANDLE handle{nullptr};
+
+    LiveCaptureStopEvent() {
+        handle = CreateEventA(nullptr, TRUE, FALSE, kLiveCaptureStopEventName);
+        if (handle != nullptr) {
+            ResetEvent(handle);
+        }
+    }
+
+    ~LiveCaptureStopEvent() {
+        if (handle != nullptr) {
+            CloseHandle(handle);
+        }
+    }
+
+    bool requested() const {
+        return handle != nullptr && WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+    }
+};
+
+void enableProcessDpiAwareness() {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+}
+#else
+struct LiveCaptureStopEvent {
+    bool requested() const {
+        return false;
+    }
+};
+
+void enableProcessDpiAwareness() {}
+#endif
 
 std::uint32_t parseU32(const char* value, std::uint32_t fallback) {
     try {
@@ -88,7 +152,8 @@ led::Status acceptReadyClient(
     const led::protocol::VideoMode& videoMode,
     led::transport::TcpStream& stream,
     led::protocol::ClientHello& hello,
-    led::protocol::ClientReady& ready) {
+    led::protocol::ClientReady& ready,
+    int acceptTimeoutMs = 0) {
     led::protocol::SessionOffer offer;
     offer.videoMode = videoMode;
     offer.rtpPort = rtpPort;
@@ -98,6 +163,12 @@ led::Status acceptReadyClient(
     auto status = listener.bindAndListen(controlPort);
     if (!status.isOk()) {
         return status;
+    }
+    if (acceptTimeoutMs > 0) {
+        status = listener.setAcceptTimeoutMs(acceptTimeoutMs);
+        if (!status.isOk()) {
+            return status;
+        }
     }
 
     std::cout << "Host test signaling listening on TCP " << listener.localPort()
@@ -195,15 +266,9 @@ int runListDisplaysMode() {
         std::cout << "Display: " << display.deviceName
                   << " origin=" << display.originX << ',' << display.originY
                   << " size=" << display.width << 'x' << display.height
-                  << " primary=" << (display.primary ? "yes" : "no") << '\n';
+                  << " primary=" << (display.primary ? "yes" : "no")
+                  << " led_virtual=" << (display.ledVirtual ? "yes" : "no") << '\n';
     }
-
-    const auto mode = led::protocol::defaultStandardMode();
-    const auto placeholderX = bounds.left + bounds.width;
-    const auto placeholderY = bounds.top;
-    std::cout << "Fallback extension target: origin=" << placeholderX << ',' << placeholderY
-              << " size=" << mode.resolution.width << 'x' << mode.resolution.height
-              << "@" << mode.resolution.refreshRate << '\n';
     return 0;
 }
 
@@ -402,6 +467,7 @@ int runSendCaptureTestStreamMode(int argc, char** argv) {
 }
 
 int runServeLiveCaptureMode(int argc, char** argv) {
+    LiveCaptureStopEvent stopEvent;
     const auto controlPort = argc >= 3 ? parsePort(argv[2], 17660) : std::uint16_t{17660};
     const auto rtpPort = argc >= 4 ? parsePort(argv[3], 17670) : std::uint16_t{17670};
     const auto inputPort = argc >= 5 ? parsePort(argv[4], 17691) : std::uint16_t{17691};
@@ -419,6 +485,7 @@ int runServeLiveCaptureMode(int argc, char** argv) {
     const auto mode = makeVideoMode(width, height, actualFps, bitrateKbps);
 
     led::host::DisplayManager displayManager;
+    signalDriverCreateMonitor();
     auto status = displayManager.createVirtualDisplay(mode.resolution);
     if (!status.isOk()) {
         led::logError(status.message());
@@ -440,7 +507,7 @@ int runServeLiveCaptureMode(int argc, char** argv) {
     led::Status inputStatus;
     std::thread inputThread([&]() {
         auto lastStatsLog = std::chrono::steady_clock::now();
-        while (!stopInput.load()) {
+        while (!stopInput.load() && !stopEvent.requested()) {
             led::protocol::InputEvent event;
             led::transport::UdpEndpoint source;
             auto receiveStatus = inputReceiver.receive(event, source);
@@ -474,7 +541,7 @@ int runServeLiveCaptureMode(int argc, char** argv) {
     led::transport::TcpStream stream;
     led::protocol::ClientHello hello;
     led::protocol::ClientReady ready;
-    status = acceptReadyClient(controlPort, rtpPort, mode, stream, hello, ready);
+    status = acceptReadyClient(controlPort, rtpPort, mode, stream, hello, ready, 10000);
     if (!status.isOk()) {
         stopInput = true;
         if (inputThread.joinable()) {
@@ -489,7 +556,7 @@ int runServeLiveCaptureMode(int argc, char** argv) {
 
     led::host::CaptureEngine capture;
     const auto& display = displayManager.virtualDisplay();
-    status = capture.startRegion(mode.resolution, display.originX, display.originY);
+    status = capture.startRegion(mode.resolution, display.originX, display.originY, display.deviceName);
     if (!status.isOk()) {
         stopInput = true;
         if (inputThread.joinable()) {
@@ -556,12 +623,45 @@ int runServeLiveCaptureMode(int argc, char** argv) {
     std::uint64_t keyFrames = 0;
     const std::string encoderBackend = encoder.backendName();
     auto lastVideoStatsLog = std::chrono::steady_clock::now();
+    auto lastCaptureRebindAttempt = std::chrono::steady_clock::now();
+    auto recoverCapture = [&]() -> led::Status {
+        for (int attempt = 0; attempt < 80 && !stopInput.load() && !stopEvent.requested(); ++attempt) {
+            signalDriverCreateMonitor();
+            auto displayStatus = displayManager.createVirtualDisplay(mode.resolution);
+            if (displayStatus.isOk()) {
+                const auto& recoveredDisplay = displayManager.virtualDisplay();
+                auto restartStatus = capture.startRegion(
+                    mode.resolution,
+                    recoveredDisplay.originX,
+                    recoveredDisplay.originY,
+                    recoveredDisplay.deviceName);
+                if (restartStatus.isOk()) {
+                    led::logInfo(
+                        "host capture rebound to LED virtual display " + recoveredDisplay.deviceName +
+                        " at " + std::to_string(recoveredDisplay.originX) + "," +
+                        std::to_string(recoveredDisplay.originY));
+                    return led::Status::ok();
+                }
+                capture.stop();
+                displayStatus = restartStatus;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            status = displayStatus;
+        }
+        return status.isOk() ? led::Status::unavailable("capture recovery timed out") : status;
+    };
 
-    while (!stopInput.load() && (frameCount == 0 || capturedFrames < frameCount)) {
+    while (!stopInput.load() && !stopEvent.requested() && (frameCount == 0 || capturedFrames < frameCount)) {
         led::host::CapturedFrame frame;
         status = capture.captureNextFrame(frame);
         if (!status.isOk()) {
-            break;
+            led::logWarn("capture failed, rebinding virtual display: " + status.message());
+            capture.stop();
+            status = recoverCapture();
+            if (!status.isOk()) {
+                break;
+            }
+            continue;
         }
 
         const auto encoded = encoder.encode(frame);
@@ -577,6 +677,24 @@ int runServeLiveCaptureMode(int argc, char** argv) {
 
         ++capturedFrames;
         const auto now = std::chrono::steady_clock::now();
+        if (!capture.dxgiCapture_ && now - lastCaptureRebindAttempt >= std::chrono::seconds(2)) {
+            lastCaptureRebindAttempt = now;
+            led::logWarn("capture is running on fallback backend; trying to restore LED virtual display binding");
+            capture.stop();
+            const auto recoverStatus = recoverCapture();
+            if (!recoverStatus.isOk()) {
+                led::logWarn("LED virtual display restore attempt failed: " + recoverStatus.message());
+                auto fallbackStatus = capture.startRegion(
+                    mode.resolution,
+                    displayManager.virtualDisplay().originX,
+                    displayManager.virtualDisplay().originY,
+                    displayManager.virtualDisplay().deviceName);
+                if (!fallbackStatus.isOk()) {
+                    status = fallbackStatus;
+                    break;
+                }
+            }
+        }
         if (now - lastVideoStatsLog >= std::chrono::seconds(1)) {
             std::cout << "Host video live stats: frames=" << capturedFrames
                       << " nals=" << nalUnitsSent
@@ -965,6 +1083,7 @@ int runSkeletonMode() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    enableProcessDpiAwareness();
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
 

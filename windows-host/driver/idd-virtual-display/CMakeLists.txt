@@ -61,6 +61,7 @@ target_link_libraries(led_idd_driver PRIVATE
     iddcxstub
     d3d11
     dxgi
+    advapi32
     ntdll)
 
 target_compile_options(led_idd_driver PRIVATE

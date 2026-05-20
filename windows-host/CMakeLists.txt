@@ -29,6 +29,14 @@ add_executable(led_host_app
 
 target_link_libraries(led_host_app PRIVATE led_host_core Threads::Threads)
 
+if(WIN32)
+    add_executable(led_host_tray WIN32
+        host-ui/tray_app.cpp)
+
+    target_compile_features(led_host_tray PRIVATE cxx_std_20)
+    target_link_libraries(led_host_tray PRIVATE shell32 user32)
+endif()
+
 if(MSVC)
     target_link_libraries(led_host_core PRIVATE
         mfplat

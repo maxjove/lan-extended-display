@@ -38,7 +38,7 @@ Status SessionManager::start(const protocol::VideoMode& requestedMode) {
     }
 
     const auto& display = displayManager_.virtualDisplay();
-    status = captureEngine_.startRegion(requestedMode.resolution, display.originX, display.originY);
+    status = captureEngine_.startRegion(requestedMode.resolution, display.originX, display.originY, display.deviceName);
     if (!status.isOk()) {
         stateMachine_.fail(status.message());
         return status;

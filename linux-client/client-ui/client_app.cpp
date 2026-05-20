@@ -23,6 +23,10 @@
 
 namespace {
 
+constexpr std::uint32_t kStartupReceiveTimeoutMs = 5000;
+constexpr std::uint32_t kActiveReceiveTimeoutMs = 1000;
+constexpr std::uint32_t kStartupIdleTimeouts = 12;
+
 std::uint16_t parsePort(const char* value, std::uint16_t fallback) {
     try {
         const auto parsed = static_cast<unsigned long>(std::stoul(value));
@@ -153,6 +157,11 @@ void printReceiverStats(const led::client::VideoReceiverStats& stats) {
                   << " max_us=" << stats.maxLatencyUs
                   << " jitter_us=" << stats.jitterUs << '\n';
     }
+}
+
+bool isReceiveTimeoutStatus(const led::Status& status) {
+    return status.message().find("Resource temporarily unavailable") != std::string::npos ||
+           status.message().find("timed out") != std::string::npos;
 }
 
 led::Status connectAndReady(
@@ -292,7 +301,7 @@ int runReceiveTestNalMode(int argc, char** argv) {
         return 1;
     }
 
-    receiver.setReceiveTimeoutMs(3000);
+    receiver.setReceiveTimeoutMs(kStartupReceiveTimeoutMs);
 
     std::vector<std::uint8_t> nalUnit;
     led::transport::UdpEndpoint source;
@@ -380,7 +389,7 @@ int runReceiveTestStreamMode(int argc, char** argv) {
         led::logError(status.message());
         return 1;
     }
-    receiver.setReceiveTimeoutMs(3000);
+    receiver.setReceiveTimeoutMs(kStartupReceiveTimeoutMs);
 
     std::atomic_bool stopInput{false};
     led::client::X11InputCaptureStats inputStats;
@@ -411,12 +420,25 @@ int runReceiveTestStreamMode(int argc, char** argv) {
     led::transport::UdpEndpoint source;
     const auto start = std::chrono::steady_clock::now();
     auto lastStatsLog = start;
+    std::uint32_t idleTimeouts = 0;
+    bool activeTimeoutApplied = false;
+    bool closedFromActiveIdle = false;
     while (expectedFrames == 0 || receivedFrames < expectedFrames) {
         std::vector<std::uint8_t> nalUnit;
         status = receiver.receiveNal(nalUnit, source);
         if (!status.isOk()) {
-            if (expectedFrames == 0 && receivedFrames > 0) {
-                break;
+            if (expectedFrames == 0 && isReceiveTimeoutStatus(status)) {
+                ++idleTimeouts;
+                if (receivedFrames > 0) {
+                    led::logInfo("RTP stream became idle after active session; closing display session");
+                    closedFromActiveIdle = true;
+                    status = led::Status::ok();
+                    break;
+                }
+                if (idleTimeouts < kStartupIdleTimeouts) {
+                    led::logWarn("waiting for first RTP frame; keeping display session open");
+                    continue;
+                }
             }
             stopInput = true;
             if (inputThread.joinable()) {
@@ -430,6 +452,7 @@ int runReceiveTestStreamMode(int argc, char** argv) {
             led::logError(status.message());
             return 1;
         }
+        idleTimeouts = 0;
         status = decoder.pushNal(nalUnit);
         if (!status.isOk()) {
             stopInput = true;
@@ -443,6 +466,10 @@ int runReceiveTestStreamMode(int argc, char** argv) {
             }
             led::logError(status.message());
             return 1;
+        }
+        if (!activeTimeoutApplied) {
+            receiver.setReceiveTimeoutMs(kActiveReceiveTimeoutMs);
+            activeTimeoutApplied = true;
         }
         ++receivedFrames;
         receivedBytes += nalUnit.size();
@@ -466,7 +493,7 @@ int runReceiveTestStreamMode(int argc, char** argv) {
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const auto receiverStats = receiver.stats();
     receiver.close();
-    decoder.drainForMs(drainMs);
+    decoder.drainForMs(closedFromActiveIdle ? std::uint32_t{100} : drainMs);
     stopInput = true;
     if (inputThread.joinable()) {
         inputThread.join();

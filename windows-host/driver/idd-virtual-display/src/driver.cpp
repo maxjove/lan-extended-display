@@ -12,6 +12,9 @@ constexpr UINT kModeCount = 3;
 constexpr UINT64 kPipelineRate1080p60 = 1920ull * 1080ull * 60ull;
 constexpr UINT64 kPipelineRate720p60 = 1280ull * 720ull * 60ull;
 constexpr UINT64 kPipelineRate1080p30 = 1920ull * 1080ull * 30ull;
+constexpr PCWSTR kActiveMonitorEventName = L"Global\\LanExtendedDisplayActiveMonitor";
+constexpr PCWSTR kCreateMonitorEventName = L"Global\\LanExtendedDisplayCreateMonitor";
+constexpr PCWSTR kDestroyMonitorEventName = L"Global\\LanExtendedDisplayDestroyMonitor";
 
 const GUID kMonitorContainerId =
     {0x7d3e54b4, 0x8117, 0x4f35, {0x9e, 0xb9, 0xa1, 0x71, 0x12, 0xb0, 0x44, 0x61}};
@@ -21,8 +24,17 @@ struct SwapChainPump {
     HANDLE surfaceEvent = nullptr;
     HANDLE stopEvent = nullptr;
     HANDLE thread = nullptr;
+    DWORD threadId = 0;
     ID3D11Device* d3dDevice = nullptr;
     IDXGIDevice* dxgiDevice = nullptr;
+};
+
+struct ControlChannel {
+    HANDLE activeEvent = nullptr;
+    HANDLE createEvent = nullptr;
+    HANDLE destroyEvent = nullptr;
+    HANDLE stopEvent = nullptr;
+    HANDLE thread = nullptr;
 };
 
 struct DeviceState {
@@ -30,6 +42,7 @@ struct DeviceState {
     IDDCX_ADAPTER adapter = nullptr;
     IDDCX_MONITOR monitor = nullptr;
     SwapChainPump pump;
+    ControlChannel control;
 };
 
 DeviceState g_state;
@@ -169,38 +182,48 @@ void FillTargetModes(IDDCX_TARGET_MODE* modes, UINT capacity, UINT* outCount) {
 
 DWORD WINAPI SwapChainThreadProc(void* context) {
     auto* pump = static_cast<SwapChainPump*>(context);
+    IDDCX_SWAPCHAIN swapChain = pump->swapChain;
 
     IDARG_IN_SWAPCHAINSETDEVICE setDevice = {};
     setDevice.pDevice = pump->dxgiDevice;
-    const HRESULT setDeviceResult = IddCxSwapChainSetDevice(pump->swapChain, &setDevice);
-    if (FAILED(setDeviceResult)) {
-        DebugLogHresult(L"IddCxSwapChainSetDevice failed", setDeviceResult);
+    HRESULT hr = IddCxSwapChainSetDevice(swapChain, &setDevice);
+    if (FAILED(hr)) {
+        DebugLogHresult(L"IddCxSwapChainSetDevice failed", hr);
+        WdfObjectDelete(reinterpret_cast<WDFOBJECT>(swapChain));
         return 0;
     }
     DebugLog(L"Swap-chain device set");
 
-    HANDLE waitHandles[2] = {pump->stopEvent, pump->surfaceEvent};
+    HANDLE waitHandles[2] = {pump->surfaceEvent, pump->stopEvent};
 
     for (;;) {
-        const DWORD wait = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
-        if (wait == WAIT_OBJECT_0) {
+        if (WaitForSingleObject(pump->stopEvent, 0) == WAIT_OBJECT_0) {
             break;
-        }
-        if (wait != WAIT_OBJECT_0 + 1) {
-            continue;
         }
 
         IDARG_OUT_RELEASEANDACQUIREBUFFER buffer = {};
         buffer.MetaData.Size = sizeof(buffer.MetaData);
-        const HRESULT acquireResult = IddCxSwapChainReleaseAndAcquireBuffer(pump->swapChain, &buffer);
+        const HRESULT acquireResult = IddCxSwapChainReleaseAndAcquireBuffer(swapChain, &buffer);
+        if (acquireResult == E_PENDING) {
+            const DWORD wait = WaitForMultipleObjects(2, waitHandles, FALSE, 16);
+            if (wait == WAIT_OBJECT_0 + 1) {
+                break;
+            }
+            continue;
+        }
         if (SUCCEEDED(acquireResult)) {
             if (buffer.MetaData.pSurface != nullptr) {
                 buffer.MetaData.pSurface->Release();
             }
-            IddCxSwapChainFinishedProcessingFrame(pump->swapChain);
+            IddCxSwapChainFinishedProcessingFrame(swapChain);
+            continue;
         }
+
+        DebugLogHresult(L"IddCxSwapChainReleaseAndAcquireBuffer failed", acquireResult);
+        break;
     }
 
+    WdfObjectDelete(reinterpret_cast<WDFOBJECT>(swapChain));
     return 0;
 }
 
@@ -209,10 +232,18 @@ void StopSwapChainPump(SwapChainPump* pump) {
         SetEvent(pump->stopEvent);
     }
 
+    if (pump->thread != nullptr && pump->threadId != GetCurrentThreadId()) {
+        const DWORD wait = WaitForSingleObject(pump->thread, 5000);
+        if (wait == WAIT_TIMEOUT) {
+            DebugLog(L"Timed out waiting for swap-chain thread to stop");
+            return;
+        }
+    }
+
     if (pump->thread != nullptr) {
-        WaitForSingleObject(pump->thread, 5000);
         CloseHandle(pump->thread);
         pump->thread = nullptr;
+        pump->threadId = 0;
     }
 
     if (pump->stopEvent != nullptr) {
@@ -303,7 +334,7 @@ NTSTATUS StartSwapChainPump(SwapChainPump* pump, const IDARG_IN_SETSWAPCHAIN* ar
         return STATUS_UNSUCCESSFUL;
     }
 
-    pump->thread = CreateThread(nullptr, 0, SwapChainThreadProc, pump, 0, nullptr);
+    pump->thread = CreateThread(nullptr, 0, SwapChainThreadProc, pump, 0, &pump->threadId);
     if (pump->thread == nullptr) {
         StopSwapChainPump(pump);
         return STATUS_UNSUCCESSFUL;
@@ -313,8 +344,11 @@ NTSTATUS StartSwapChainPump(SwapChainPump* pump, const IDARG_IN_SETSWAPCHAIN* ar
 }
 
 NTSTATUS CreateVirtualMonitor() {
-    if (g_state.adapter == nullptr || g_state.monitor != nullptr) {
+    if (g_state.monitor != nullptr) {
         return STATUS_SUCCESS;
+    }
+    if (g_state.adapter == nullptr) {
+        return STATUS_DEVICE_NOT_READY;
     }
 
     IDDCX_MONITOR_DESCRIPTION description = {};
@@ -352,6 +386,167 @@ NTSTATUS CreateVirtualMonitor() {
     return STATUS_SUCCESS;
 }
 
+NTSTATUS DestroyVirtualMonitor() {
+    EnsureLock();
+    EnterCriticalSection(&g_stateLock);
+    const IDDCX_MONITOR monitor = g_state.monitor;
+    if (monitor == nullptr) {
+        LeaveCriticalSection(&g_stateLock);
+        return STATUS_SUCCESS;
+    }
+    g_state.monitor = nullptr;
+    LeaveCriticalSection(&g_stateLock);
+
+    StopSwapChainPump(&g_state.pump);
+    const NTSTATUS status = IddCxMonitorDeparture(monitor);
+    if (!NT_SUCCESS(status)) {
+        DebugLogStatus(L"IddCxMonitorDeparture failed", status);
+        return status;
+    }
+
+    DebugLog(L"Virtual monitor departed");
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS RetryCreateVirtualMonitor() {
+    NTSTATUS status = STATUS_DEVICE_NOT_READY;
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        EnsureLock();
+        EnterCriticalSection(&g_stateLock);
+        status = CreateVirtualMonitor();
+        LeaveCriticalSection(&g_stateLock);
+        if (NT_SUCCESS(status)) {
+            return status;
+        }
+        Sleep(100);
+    }
+    return status;
+}
+
+NTSTATUS RequestDestroyVirtualMonitor() {
+    return DestroyVirtualMonitor();
+}
+
+bool ActiveMonitorRequested() {
+    return g_state.control.activeEvent != nullptr &&
+        WaitForSingleObject(g_state.control.activeEvent, 0) == WAIT_OBJECT_0;
+}
+
+DWORD WINAPI ControlThreadProc(void*) {
+    DebugLog(L"Control thread started");
+    HANDLE waitHandles[3] = {
+        g_state.control.stopEvent,
+        g_state.control.createEvent,
+        g_state.control.destroyEvent,
+    };
+
+    for (;;) {
+        const DWORD wait = WaitForMultipleObjects(3, waitHandles, FALSE, INFINITE);
+        if (wait == WAIT_OBJECT_0) {
+            break;
+        }
+        if (wait == WAIT_OBJECT_0 + 1) {
+            DebugLog(L"Create monitor requested");
+            if (g_state.control.activeEvent != nullptr) {
+                SetEvent(g_state.control.activeEvent);
+            }
+            const NTSTATUS status = RetryCreateVirtualMonitor();
+            if (!NT_SUCCESS(status)) {
+                DebugLogStatus(L"Create monitor request failed", status);
+            }
+            continue;
+        }
+        if (wait == WAIT_OBJECT_0 + 2) {
+            DebugLog(L"Destroy monitor requested");
+            if (g_state.control.activeEvent != nullptr) {
+                ResetEvent(g_state.control.activeEvent);
+            }
+            const NTSTATUS status = RequestDestroyVirtualMonitor();
+            if (!NT_SUCCESS(status)) {
+                DebugLogStatus(L"Destroy monitor request failed", status);
+            }
+            continue;
+        }
+    }
+
+    DebugLog(L"Control thread stopped");
+    return 0;
+}
+
+bool CreateWorldWritableEvent(PCWSTR name, bool manualReset, HANDLE* outHandle) {
+    SECURITY_DESCRIPTOR descriptor{};
+    if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION)) {
+        return false;
+    }
+    if (!SetSecurityDescriptorDacl(&descriptor, TRUE, nullptr, FALSE)) {
+        return false;
+    }
+
+    SECURITY_ATTRIBUTES attributes{};
+    attributes.nLength = sizeof(attributes);
+    attributes.lpSecurityDescriptor = &descriptor;
+    attributes.bInheritHandle = FALSE;
+
+    *outHandle = CreateEventW(&attributes, manualReset, FALSE, name);
+    return *outHandle != nullptr;
+}
+
+NTSTATUS StartControlChannel(ControlChannel* control) {
+    if (control->thread != nullptr) {
+        return STATUS_SUCCESS;
+    }
+
+    if (!CreateWorldWritableEvent(kActiveMonitorEventName, true, &control->activeEvent) ||
+        !CreateWorldWritableEvent(kCreateMonitorEventName, false, &control->createEvent) ||
+        !CreateWorldWritableEvent(kDestroyMonitorEventName, false, &control->destroyEvent)) {
+        DebugLog(L"Create control events failed");
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    control->stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (control->stopEvent == nullptr) {
+        DebugLog(L"Create control stop event failed");
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    control->thread = CreateThread(nullptr, 0, ControlThreadProc, nullptr, 0, nullptr);
+    if (control->thread == nullptr) {
+        DebugLog(L"Create control thread failed");
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+void StopControlChannel(ControlChannel* control) {
+    if (control->stopEvent != nullptr) {
+        SetEvent(control->stopEvent);
+    }
+
+    if (control->thread != nullptr) {
+        WaitForSingleObject(control->thread, 5000);
+        CloseHandle(control->thread);
+        control->thread = nullptr;
+    }
+
+    if (control->stopEvent != nullptr) {
+        CloseHandle(control->stopEvent);
+        control->stopEvent = nullptr;
+    }
+    if (control->createEvent != nullptr) {
+        CloseHandle(control->createEvent);
+        control->createEvent = nullptr;
+    }
+    if (control->destroyEvent != nullptr) {
+        CloseHandle(control->destroyEvent);
+        control->destroyEvent = nullptr;
+    }
+    if (control->activeEvent != nullptr) {
+        CloseHandle(control->activeEvent);
+        control->activeEvent = nullptr;
+    }
+}
+
 NTSTATUS NTAPI EvtIddAdapterInitFinished(
     IDDCX_ADAPTER adapter,
     const IDARG_IN_ADAPTER_INIT_FINISHED* args) {
@@ -365,9 +560,13 @@ NTSTATUS NTAPI EvtIddAdapterInitFinished(
     EnsureLock();
     EnterCriticalSection(&g_stateLock);
     g_state.adapter = adapter;
-    const NTSTATUS status = CreateVirtualMonitor();
+    NTSTATUS status = STATUS_SUCCESS;
+    if (ActiveMonitorRequested()) {
+        DebugLog(L"Active monitor requested during adapter init");
+        status = CreateVirtualMonitor();
+    }
     LeaveCriticalSection(&g_stateLock);
-    DebugLogStatus(L"EvtIddAdapterInitFinished", status);
+    DebugLog(L"Adapter initialized");
     return status;
 }
 
@@ -448,6 +647,7 @@ NTSTATUS NTAPI EvtIddAssignSwapChain(
     IDDCX_MONITOR monitor,
     const IDARG_IN_SETSWAPCHAIN* args) {
     UNREFERENCED_PARAMETER(monitor);
+    DebugLog(L"Assign swap-chain requested");
     EnsureLock();
     EnterCriticalSection(&g_stateLock);
     const NTSTATUS status = StartSwapChainPump(&g_state.pump, args);
@@ -457,10 +657,8 @@ NTSTATUS NTAPI EvtIddAssignSwapChain(
 
 NTSTATUS NTAPI EvtIddUnassignSwapChain(IDDCX_MONITOR monitor) {
     UNREFERENCED_PARAMETER(monitor);
-    EnsureLock();
-    EnterCriticalSection(&g_stateLock);
+    DebugLog(L"Unassign swap-chain requested");
     StopSwapChainPump(&g_state.pump);
-    LeaveCriticalSection(&g_stateLock);
     return STATUS_SUCCESS;
 }
 
@@ -562,16 +760,21 @@ NTSTATUS NTAPI EvtDriverDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT deviceInit) 
     g_state.wdfDevice = device;
     LeaveCriticalSection(&g_stateLock);
 
+    status = StartControlChannel(&g_state.control);
+    if (!NT_SUCCESS(status)) {
+        DebugLogStatus(L"StartControlChannel failed", status);
+        return status;
+    }
+
     DebugLog(L"Device created");
     return STATUS_SUCCESS;
 }
 
 void NTAPI EvtDriverUnload(WDFDRIVER driver) {
     UNREFERENCED_PARAMETER(driver);
-    EnsureLock();
-    EnterCriticalSection(&g_stateLock);
+    DestroyVirtualMonitor();
     StopSwapChainPump(&g_state.pump);
-    LeaveCriticalSection(&g_stateLock);
+    StopControlChannel(&g_state.control);
     DebugLog(L"Driver unload");
 }
 
