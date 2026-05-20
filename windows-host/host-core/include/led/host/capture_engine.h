@@ -1,0 +1,51 @@
+#pragma once
+
+#include "led/common/status.h"
+#include "led/protocol/messages.h"
+
+#include <chrono>
+#include <cstdint>
+#include <vector>
+
+namespace led::host {
+
+struct CapturedFrame {
+    std::uint64_t frameId{0};
+    std::uint64_t timestampUs{0};
+    std::uint32_t width{0};
+    std::uint32_t height{0};
+    std::vector<std::uint8_t> bgra;
+};
+
+class CaptureEngine {
+public:
+    Status start(const protocol::Resolution& resolution);
+    Status startRegion(const protocol::Resolution& resolution, int originX, int originY);
+    Status captureNextFrame(CapturedFrame& frame);
+    Status stop();
+
+    [[nodiscard]] bool isRunning() const;
+    [[nodiscard]] CapturedFrame latestFrame() const;
+
+public:
+    // Internal backend state. Kept here so platform-specific capture helpers can stay out of the public methods.
+    bool running_{false};
+    bool dxgiCapture_{false};
+    CapturedFrame latestFrame_{};
+    std::chrono::steady_clock::time_point startTime_{};
+    void* screenDc_{nullptr};
+    void* memoryDc_{nullptr};
+    void* bitmap_{nullptr};
+    void* bitmapBits_{nullptr};
+    void* d3dDevice_{nullptr};
+    void* d3dContext_{nullptr};
+    void* dxgiDuplication_{nullptr};
+    void* stagingTexture_{nullptr};
+    std::uint32_t sourceWidth_{0};
+    std::uint32_t sourceHeight_{0};
+    int sourceOriginX_{0};
+    int sourceOriginY_{0};
+    bool captureRegion_{false};
+};
+
+}  // namespace led::host
