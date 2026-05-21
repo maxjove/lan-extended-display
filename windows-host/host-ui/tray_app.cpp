@@ -34,9 +34,10 @@ constexpr int kMenuManualIp = 1004;
 constexpr int kMenuRefreshDevices = 1005;
 constexpr int kMenuOpenLog = 1006;
 constexpr int kMenuInstallFirewall = 1007;
-constexpr int kMenuQuality45 = 1010;
-constexpr int kMenuQuality55 = 1011;
-constexpr int kMenuQuality65 = 1012;
+constexpr int kMenuQuality55 = 1010;
+constexpr int kMenuQuality75 = 1011;
+constexpr int kMenuQuality85 = 1012;
+constexpr int kMenuQuality90 = 1013;
 constexpr int kMenuDeviceBase = 2000;
 constexpr int kMaxDeviceMenuItems = 64;
 constexpr UINT_PTR kMonitorTimerId = 2001;
@@ -535,7 +536,7 @@ std::wstring trayConfigPath() {
 }
 
 int normalizeJpegQuality(int quality) {
-    if (quality == 45 || quality == 55 || quality == 65) {
+    if (quality == 55 || quality == 75 || quality == 85 || quality == 90) {
         return quality;
     }
     return 55;
@@ -576,9 +577,8 @@ bool installFirewallRules(HWND window) {
         L"@{Name='LAN Extended Display Telemetry';Protocol='UDP';Port='17692'}"
         L");"
         L"foreach($rule in $rules){"
-        L"  if(-not (Get-NetFirewallRule -DisplayName $rule.Name -ErrorAction SilentlyContinue)){"
-        L"    New-NetFirewallRule -DisplayName $rule.Name -Direction Inbound -Action Allow -Profile Private,Domain -Protocol $rule.Protocol -LocalPort $rule.Port | Out-Null"
-        L"  }"
+        L"  Get-NetFirewallRule -DisplayName $rule.Name -ErrorAction SilentlyContinue | Remove-NetFirewallRule;"
+        L"  New-NetFirewallRule -DisplayName $rule.Name -Direction Inbound -Action Allow -Profile Any -Protocol $rule.Protocol -LocalPort $rule.Port | Out-Null"
         L"}";
     const std::wstring parameters =
         L"-NoProfile -ExecutionPolicy Bypass -Command " + quote(script);
@@ -1093,9 +1093,10 @@ void showTrayMenu(HWND window) {
     AppendMenuW(menu, MF_STRING, kMenuRefreshDevices, L"Refresh clients");
     HMENU qualityMenu = CreatePopupMenu();
     const int quality = normalizeJpegQuality(g_jpegQuality);
-    AppendMenuW(qualityMenu, MF_STRING | (quality == 45 ? MF_CHECKED : 0), kMenuQuality45, L"Fast 45");
-    AppendMenuW(qualityMenu, MF_STRING | (quality == 55 ? MF_CHECKED : 0), kMenuQuality55, L"Balanced 55");
-    AppendMenuW(qualityMenu, MF_STRING | (quality == 65 ? MF_CHECKED : 0), kMenuQuality65, L"Sharp 65");
+    AppendMenuW(qualityMenu, MF_STRING | (quality == 55 ? MF_CHECKED : 0), kMenuQuality55, L"Fast 55");
+    AppendMenuW(qualityMenu, MF_STRING | (quality == 75 ? MF_CHECKED : 0), kMenuQuality75, L"Balanced 75");
+    AppendMenuW(qualityMenu, MF_STRING | (quality == 85 ? MF_CHECKED : 0), kMenuQuality85, L"Sharp 85");
+    AppendMenuW(qualityMenu, MF_STRING | (quality == 90 ? MF_CHECKED : 0), kMenuQuality90, L"Ultra 90");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(qualityMenu), L"Quality");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (busy ? 0 : MF_GRAYED), kMenuStop, L"Stop extended display");
@@ -1181,18 +1182,21 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             sendDiscoveryProbe();
             showBalloon(window, L"Scanning", L"Looking for Linux extended display clients on the LAN.");
             return 0;
-        case kMenuQuality45:
-            setJpegQuality(window, 45);
-            return 0;
         case kMenuQuality55:
             setJpegQuality(window, 55);
             return 0;
-        case kMenuQuality65:
-            setJpegQuality(window, 65);
+        case kMenuQuality75:
+            setJpegQuality(window, 75);
+            return 0;
+        case kMenuQuality85:
+            setJpegQuality(window, 85);
+            return 0;
+        case kMenuQuality90:
+            setJpegQuality(window, 90);
             return 0;
         case kMenuInstallFirewall:
             if (installFirewallRules(window)) {
-                showBalloon(window, L"Firewall rules installed", L"Discovery and streaming ports are allowed on private networks.");
+                showBalloon(window, L"Firewall rules installed", L"Discovery and streaming ports are allowed on all Windows network profiles.");
                 sendDiscoveryProbe();
             } else {
                 MessageBoxW(window, L"Firewall rule installation failed or was cancelled.", L"LAN Extended Display", MB_ICONERROR);

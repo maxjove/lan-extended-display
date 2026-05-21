@@ -45,6 +45,7 @@ if(MSVC)
         mfuuid
         wmcodecdspuuid
         gdiplus
+        windowscodecs
         d3d11
         dxgi
         ole32)

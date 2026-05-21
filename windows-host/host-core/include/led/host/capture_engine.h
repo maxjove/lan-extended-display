@@ -37,6 +37,9 @@ public:
     std::chrono::steady_clock::time_point startTime_{};
     void* screenDc_{nullptr};
     bool screenDcCreated_{false};
+    bool dxgiFallbackActive_{false};
+    std::chrono::steady_clock::time_point nextDxgiRetryTime_{};
+    std::uint32_t dxgiFallbackRetryCount_{0};
     void* memoryDc_{nullptr};
     void* bitmap_{nullptr};
     void* bitmapBits_{nullptr};

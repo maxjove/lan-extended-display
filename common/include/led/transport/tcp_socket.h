@@ -71,6 +71,7 @@ private:
 
     NativeSocket socket_{kInvalidSocket};
     std::uint16_t localPort_{0};
+    int acceptTimeoutMs_{0};
 };
 
 }  // namespace led::transport

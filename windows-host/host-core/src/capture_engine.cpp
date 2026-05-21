@@ -26,6 +26,8 @@ namespace led::host {
 #if defined(_WIN32)
 namespace {
 
+constexpr auto kDxgiFallbackRetryInterval = std::chrono::milliseconds(500);
+
 std::string hresultText(HRESULT hr, const char* operation) {
     return std::string(operation) + " failed with HRESULT 0x" + std::to_string(static_cast<unsigned long>(hr));
 }
@@ -240,8 +242,6 @@ void stopDxgiCapture(CaptureEngine& engine) {
     releaseCom(engine.dxgiDuplication_);
     releaseCom(engine.d3dContext_);
     releaseCom(engine.d3dDevice_);
-    engine.sourceWidth_ = 0;
-    engine.sourceHeight_ = 0;
     engine.dxgiCapture_ = false;
 }
 
@@ -305,6 +305,12 @@ Status startGdiCapture(CaptureEngine& engine, const protocol::Resolution& resolu
 
     SelectObject(static_cast<HDC>(engine.memoryDc_), static_cast<HBITMAP>(engine.bitmap_));
     SetStretchBltMode(static_cast<HDC>(engine.memoryDc_), HALFTONE);
+    if (engine.sourceWidth_ == 0) {
+        engine.sourceWidth_ = resolution.width;
+    }
+    if (engine.sourceHeight_ == 0) {
+        engine.sourceHeight_ = resolution.height;
+    }
     return Status::ok();
 }
 
@@ -361,6 +367,26 @@ Status captureGdiFrame(CaptureEngine& engine, CapturedFrame& frame) {
     std::memcpy(frame.bgra.data(), engine.bitmapBits_, byteCount);
     engine.capturedRealFrame_ = true;
     return Status::ok();
+}
+
+Status retryDxgiCapture(CaptureEngine& engine, const protocol::Resolution& resolution, bool forceLog) {
+    auto status = startDxgiCapture(engine, resolution, engine.captureRegion_, engine.sourceOriginX_, engine.sourceOriginY_);
+    if (status.isOk()) {
+        stopGdiCapture(engine);
+        engine.dxgiFallbackActive_ = false;
+        engine.dxgiFallbackRetryCount_ = 0;
+        engine.nextDxgiRetryTime_ = {};
+        logInfo("host capture engine recovered DXGI Desktop Duplication backend");
+        return Status::ok();
+    }
+
+    engine.dxgiFallbackActive_ = true;
+    engine.nextDxgiRetryTime_ = std::chrono::steady_clock::now() + kDxgiFallbackRetryInterval;
+    ++engine.dxgiFallbackRetryCount_;
+    if (forceLog || engine.dxgiFallbackRetryCount_ == 1 || (engine.dxgiFallbackRetryCount_ % 20) == 0) {
+        logWarn("DXGI fallback retry failed: " + status.message());
+    }
+    return status;
 }
 
 Status captureDxgiFrame(CaptureEngine& engine, CapturedFrame& frame) {
@@ -439,6 +465,9 @@ Status startCapture(CaptureEngine& engine, const protocol::Resolution& resolutio
     engine.running_ = true;
     engine.captureRegion_ = captureRegion;
     engine.capturedRealFrame_ = false;
+    engine.dxgiFallbackActive_ = false;
+    engine.nextDxgiRetryTime_ = {};
+    engine.dxgiFallbackRetryCount_ = 0;
     engine.sourceOriginX_ = originX;
     engine.sourceOriginY_ = originY;
     engine.sourceDeviceName_ = std::move(deviceName);
@@ -456,13 +485,16 @@ Status startCapture(CaptureEngine& engine, const protocol::Resolution& resolutio
         logInfo("host capture engine started with DXGI Desktop Duplication backend");
         return Status::ok();
     }
-    logWarn("DXGI Desktop Duplication unavailable, falling back to GDI capture: " + dxgiStatus.message());
+    logWarn("DXGI Desktop Duplication unavailable, using temporary GDI capture while retrying DXGI: " + dxgiStatus.message());
     auto gdiStatus = startGdiCapture(engine, resolution);
     if (!gdiStatus.isOk()) {
         engine.running_ = false;
         return gdiStatus;
     }
-    logInfo("host capture engine started with GDI desktop capture backend");
+    engine.dxgiFallbackActive_ = true;
+    engine.dxgiFallbackRetryCount_ = 1;
+    engine.nextDxgiRetryTime_ = std::chrono::steady_clock::now() + kDxgiFallbackRetryInterval;
+    logInfo("host capture engine started with temporary GDI desktop capture backend");
 #else
     logInfo("host capture engine started with placeholder D3D11 path");
 #endif
@@ -511,7 +543,7 @@ Status CaptureEngine::captureNextFrame(CapturedFrame& frame) {
                 }
             }
             const auto dxgiFailure = restartStatus.isOk() ? status.message() : restartStatus.message();
-            logWarn("DXGI reinitialize failed, switching to GDI capture: " + dxgiFailure);
+            logWarn("DXGI reinitialize failed, using temporary GDI capture while retrying DXGI: " + dxgiFailure);
             auto gdiStatus = startGdiCapture(*this, protocol::Resolution{
                 latestFrame_.width,
                 latestFrame_.height,
@@ -520,10 +552,25 @@ Status CaptureEngine::captureNextFrame(CapturedFrame& frame) {
             if (!gdiStatus.isOk()) {
                 return gdiStatus;
             }
-            logInfo("host capture engine switched to GDI desktop capture backend");
+            dxgiFallbackActive_ = true;
+            dxgiFallbackRetryCount_ = 1;
+            nextDxgiRetryTime_ = std::chrono::steady_clock::now() + kDxgiFallbackRetryInterval;
+            logInfo("host capture engine switched to temporary GDI desktop capture backend");
         } else {
             frame = latestFrame_;
             return Status::ok();
+        }
+    }
+
+    if (!dxgiCapture_ && dxgiFallbackActive_ && std::chrono::steady_clock::now() >= nextDxgiRetryTime_) {
+        const auto retryStatus = retryDxgiCapture(*this, protocol::Resolution{latestFrame_.width, latestFrame_.height, 0}, false);
+        if (retryStatus.isOk()) {
+            auto status = captureDxgiFrame(*this, latestFrame_);
+            if (status.isOk()) {
+                frame = latestFrame_;
+                return Status::ok();
+            }
+            logWarn("DXGI capture failed immediately after recovery: " + status.message());
         }
     }
 
@@ -542,6 +589,9 @@ Status CaptureEngine::stop() {
 #if defined(_WIN32)
     stopDxgiCapture(*this);
     stopGdiCapture(*this);
+    dxgiFallbackActive_ = false;
+    nextDxgiRetryTime_ = {};
+    dxgiFallbackRetryCount_ = 0;
 #endif
     logInfo("host capture engine stopped");
     return Status::ok();

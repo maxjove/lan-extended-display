@@ -1142,26 +1142,88 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     std::uint32_t capturedFrames = 0;
     std::uint64_t encodedBytes = 0;
     std::uint64_t packetsSent = 0;
+    std::uint64_t sendFailures = 0;
     std::uint64_t dirtyFrames = 0;
     std::uint64_t fullFrames = 0;
     std::uint64_t skippedFrames = 0;
+    std::uint64_t idleRefreshFrames = 0;
     std::uint64_t dirtyAreaPixels = 0;
     const float quality = std::clamp(static_cast<float>(qualityPercent) / 100.0F, 0.1F, 1.0F);
+    const float idleRefreshQuality = std::max(quality, 0.85F);
     led::host::CapturedFrame previousFrame;
     const auto keyFrameInterval = std::max<std::uint32_t>(1, actualFps);
+    std::uint32_t idleFrames = 0;
+    bool idleRefreshArmed = true;
+    bool forceRecoveryFrame = false;
+    auto recoverCapture = [&]() -> led::Status {
+        for (int attempt = 0; attempt < 180 && !stopEvent.requested(); ++attempt) {
+            signalDriverCreateMonitor();
+            auto displayStatus = displayManager.createVirtualDisplay(mode.resolution);
+            if (displayStatus.isOk()) {
+                const auto& recoveredDisplay = displayManager.virtualDisplay();
+                auto restartStatus = capture.startRegion(
+                    mode.resolution,
+                    recoveredDisplay.originX,
+                    recoveredDisplay.originY,
+                    recoveredDisplay.deviceName);
+                if (restartStatus.isOk()) {
+                    led::logInfo(
+                        "host MJPEG capture rebound to LED virtual display " + recoveredDisplay.deviceName +
+                        " at " + std::to_string(recoveredDisplay.originX) + "," +
+                        std::to_string(recoveredDisplay.originY));
+                    return led::Status::ok();
+                }
+                capture.stop();
+                displayStatus = restartStatus;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            status = displayStatus;
+        }
+        return status.isOk() ? led::Status::unavailable("MJPEG capture recovery timed out") : status;
+    };
 
     while (!stopEvent.requested() && (frameCount == 0 || capturedFrames < frameCount)) {
         led::host::CapturedFrame frame;
         status = capture.captureNextFrame(frame);
         if (!status.isOk()) {
-            break;
+            led::logWarn("MJPEG capture failed, rebinding virtual display: " + status.message());
+            capture.stop();
+            status = recoverCapture();
+            if (!status.isOk()) {
+                break;
+            }
+            previousFrame = {};
+            forceRecoveryFrame = true;
+            idleFrames = 0;
+            idleRefreshArmed = true;
+            nextFrameTime = std::chrono::steady_clock::now();
+            continue;
         }
 
-        const bool forceKeyFrame = previousFrame.bgra.empty() || (capturedFrames % keyFrameInterval) == 0;
-        const auto dirty = forceKeyFrame
+        const bool forceKeyFrame =
+            forceRecoveryFrame || previousFrame.bgra.empty() || (capturedFrames % keyFrameInterval) == 0;
+        auto dirty = forceKeyFrame
             ? fullDirtyRect(frame.width, frame.height)
             : computeDirtyRect(frame, previousFrame, 16, 0.70);
         previousFrame = frame;
+        bool idleRefresh = false;
+        if (dirty.empty) {
+            ++idleFrames;
+            if (idleRefreshArmed && idleFrames >= std::max<std::uint32_t>(1, actualFps / 5)) {
+                dirty = fullDirtyRect(frame.width, frame.height);
+                idleRefresh = true;
+                idleRefreshArmed = false;
+            } else {
+                ++capturedFrames;
+                ++skippedFrames;
+                nextFrameTime += frameInterval;
+                std::this_thread::sleep_until(nextFrameTime);
+                continue;
+            }
+        } else {
+            idleFrames = 0;
+            idleRefreshArmed = true;
+        }
         if (dirty.empty) {
             ++capturedFrames;
             ++skippedFrames;
@@ -1171,7 +1233,14 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
         }
 
         led::host::EncodedJpegFrame jpeg;
-        status = led::host::encodeBgraJpegRect(frame, dirty.x, dirty.y, dirty.width, dirty.height, quality, jpeg);
+        status = led::host::encodeBgraJpegRect(
+            frame,
+            dirty.x,
+            dirty.y,
+            dirty.width,
+            dirty.height,
+            idleRefresh ? idleRefreshQuality : quality,
+            jpeg);
         if (!status.isOk()) {
             break;
         }
@@ -1200,9 +1269,19 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             ++packetsSent;
         }
         if (!status.isOk()) {
-            break;
+            ++sendFailures;
+            led::logWarn("MJPEG UDP send failed, keeping session alive: " + status.message());
+            status = led::Status::ok();
+            previousFrame = {};
+            forceRecoveryFrame = true;
+            idleFrames = 0;
+            idleRefreshArmed = true;
+            nextFrameTime = std::chrono::steady_clock::now() + frameInterval;
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            continue;
         }
 
+        forceRecoveryFrame = false;
         ++capturedFrames;
         encodedBytes += jpeg.jpegBytes.size();
         dirtyAreaPixels += static_cast<std::uint64_t>(dirty.width) * dirty.height;
@@ -1210,6 +1289,9 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             ++fullFrames;
         } else {
             ++dirtyFrames;
+        }
+        if (idleRefresh) {
+            ++idleRefreshFrames;
         }
         const auto now = std::chrono::steady_clock::now();
         if (now - lastVideoStatsLog >= std::chrono::seconds(1)) {
@@ -1220,7 +1302,9 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                       << " avg_frame_kb=" << (capturedFrames == 0 ? 0 : (encodedBytes / 1024 / capturedFrames))
                       << " full=" << fullFrames
                       << " dirty=" << dirtyFrames
+                      << " idle_refresh=" << idleRefreshFrames
                       << " skipped=" << skippedFrames
+                      << " send_failures=" << sendFailures
                       << " avg_dirty_pct=" << (capturedFrames == 0 ? 0.0 :
                           (static_cast<double>(dirtyAreaPixels) * 100.0 /
                            (static_cast<double>(capturedFrames) * mode.resolution.width * mode.resolution.height)))
@@ -1265,7 +1349,9 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
               << " quality=" << quality
               << " full=" << fullFrames
               << " dirty=" << dirtyFrames
+              << " idle_refresh=" << idleRefreshFrames
               << " skipped=" << skippedFrames
+              << " send_failures=" << sendFailures
               << " packets=" << packetsSent
               << " encoded_bytes=" << encodedBytes << '\n';
     return 0;

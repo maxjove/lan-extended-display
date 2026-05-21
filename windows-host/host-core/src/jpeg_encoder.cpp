@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <gdiplus.h>
 #include <objbase.h>
+#include <wincodec.h>
 #include <wrl/client.h>
 #endif
 
@@ -71,6 +72,138 @@ led::Status jpegEncoderClsid(CLSID& clsid) {
     return Status::unavailable("GDI+ JPEG encoder was not found");
 }
 
+Status readStreamBytes(IStream* stream, std::vector<std::uint8_t>& bytes) {
+    STATSTG stat{};
+    HRESULT hr = stream->Stat(&stat, STATFLAG_NONAME);
+    if (FAILED(hr) || stat.cbSize.QuadPart <= 0) {
+        return Status::unavailable(FAILED(hr) ? hresultText(hr, "IStream::Stat") : "JPEG stream is empty");
+    }
+    LARGE_INTEGER zero{};
+    hr = stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "IStream::Seek"));
+    }
+    bytes.assign(static_cast<std::size_t>(stat.cbSize.QuadPart), 0);
+    ULONG read = 0;
+    hr = stream->Read(bytes.data(), static_cast<ULONG>(bytes.size()), &read);
+    if (FAILED(hr) || read != bytes.size()) {
+        return Status::unavailable(FAILED(hr) ? hresultText(hr, "IStream::Read") : "short JPEG stream read");
+    }
+    return Status::ok();
+}
+
+Status encodeBgraJpegRectWic(
+    const CapturedFrame& frame,
+    std::uint32_t x,
+    std::uint32_t y,
+    std::uint32_t width,
+    std::uint32_t height,
+    float quality,
+    EncodedJpegFrame& encoded) {
+    Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+    HRESULT hr = CoCreateInstance(
+        CLSID_WICImagingFactory,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "CoCreateInstance(IWICImagingFactory)"));
+    }
+
+    Microsoft::WRL::ComPtr<IStream> stream;
+    hr = CreateStreamOnHGlobal(nullptr, TRUE, &stream);
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "CreateStreamOnHGlobal"));
+    }
+
+    Microsoft::WRL::ComPtr<IWICBitmapEncoder> encoder;
+    hr = factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder);
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "IWICImagingFactory::CreateEncoder"));
+    }
+    hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "IWICBitmapEncoder::Initialize"));
+    }
+
+    Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> frameEncode;
+    Microsoft::WRL::ComPtr<IPropertyBag2> options;
+    hr = encoder->CreateNewFrame(&frameEncode, &options);
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "IWICBitmapEncoder::CreateNewFrame"));
+    }
+
+    PROPBAG2 optionNames[2]{};
+    optionNames[0].pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+    optionNames[1].pstrName = const_cast<LPOLESTR>(L"JpegYCrCbSubsampling");
+    VARIANT optionValues[2]{};
+    VariantInit(&optionValues[0]);
+    VariantInit(&optionValues[1]);
+    optionValues[0].vt = VT_R4;
+    optionValues[0].fltVal = std::clamp(quality, 0.1F, 1.0F);
+    optionValues[1].vt = VT_UI1;
+    optionValues[1].bVal = static_cast<BYTE>(WICJpegYCrCbSubsampling444);
+    hr = options->Write(2, optionNames, optionValues);
+    VariantClear(&optionValues[0]);
+    VariantClear(&optionValues[1]);
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "IPropertyBag2::Write"));
+    }
+
+    hr = frameEncode->Initialize(options.Get());
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "IWICBitmapFrameEncode::Initialize"));
+    }
+    hr = frameEncode->SetSize(width, height);
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "IWICBitmapFrameEncode::SetSize"));
+    }
+    WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat24bppBGR;
+    hr = frameEncode->SetPixelFormat(&pixelFormat);
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "IWICBitmapFrameEncode::SetPixelFormat"));
+    }
+
+    Microsoft::WRL::ComPtr<IWICBitmap> bitmap;
+    const auto sourceStride = frame.width * 4;
+    const auto sourceBytes = (height - 1) * sourceStride + width * 4;
+    auto* source = const_cast<BYTE*>(reinterpret_cast<const BYTE*>(
+        frame.bgra.data() + (static_cast<std::size_t>(y) * frame.width + x) * 4));
+    hr = factory->CreateBitmapFromMemory(
+        width,
+        height,
+        GUID_WICPixelFormat32bppBGRA,
+        sourceStride,
+        sourceBytes,
+        source,
+        &bitmap);
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "IWICImagingFactory::CreateBitmapFromMemory"));
+    }
+    hr = frameEncode->WriteSource(bitmap.Get(), nullptr);
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "IWICBitmapFrameEncode::WriteSource"));
+    }
+    hr = frameEncode->Commit();
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "IWICBitmapFrameEncode::Commit"));
+    }
+    hr = encoder->Commit();
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "IWICBitmapEncoder::Commit"));
+    }
+
+    auto status = readStreamBytes(stream.Get(), encoded.jpegBytes);
+    if (!status.isOk()) {
+        return status;
+    }
+    encoded.frameId = frame.frameId;
+    encoded.timestampUs = frame.timestampUs;
+    encoded.width = width;
+    encoded.height = height;
+    return Status::ok();
+}
+
 }  // namespace
 #endif
 
@@ -103,6 +236,14 @@ Status encodeBgraJpegRect(
         return Status::unavailable(hresultText(coHr, "CoInitializeEx"));
     }
 
+    auto status = encodeBgraJpegRectWic(frame, x, y, width, height, quality, encoded);
+    if (status.isOk()) {
+        if (coInitialized) {
+            CoUninitialize();
+        }
+        return Status::ok();
+    }
+
     if (!gdiplusRuntime().isOk()) {
         if (coInitialized) {
             CoUninitialize();
@@ -111,7 +252,7 @@ Status encodeBgraJpegRect(
     }
 
     CLSID clsid{};
-    auto status = jpegEncoderClsid(clsid);
+    status = jpegEncoderClsid(clsid);
     if (!status.isOk()) {
         if (coInitialized) {
             CoUninitialize();
@@ -151,24 +292,12 @@ Status encodeBgraJpegRect(
         return Status::unavailable("GDI+ JPEG save failed with status " + std::to_string(static_cast<int>(saveStatus)));
     }
 
-    STATSTG stat{};
-    hr = stream->Stat(&stat, STATFLAG_NONAME);
-    if (FAILED(hr) || stat.cbSize.QuadPart <= 0) {
+    status = readStreamBytes(stream.Get(), encoded.jpegBytes);
+    if (!status.isOk()) {
         if (coInitialized) {
             CoUninitialize();
         }
-        return Status::unavailable(FAILED(hr) ? hresultText(hr, "IStream::Stat") : "JPEG stream is empty");
-    }
-    LARGE_INTEGER zero{};
-    stream->Seek(zero, STREAM_SEEK_SET, nullptr);
-    encoded.jpegBytes.assign(static_cast<std::size_t>(stat.cbSize.QuadPart), 0);
-    ULONG read = 0;
-    hr = stream->Read(encoded.jpegBytes.data(), static_cast<ULONG>(encoded.jpegBytes.size()), &read);
-    if (FAILED(hr) || read != encoded.jpegBytes.size()) {
-        if (coInitialized) {
-            CoUninitialize();
-        }
-        return Status::unavailable(FAILED(hr) ? hresultText(hr, "IStream::Read") : "short JPEG stream read");
+        return status;
     }
 
     encoded.frameId = frame.frameId;

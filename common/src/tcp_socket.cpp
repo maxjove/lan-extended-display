@@ -424,6 +424,7 @@ Status TcpListener::setAcceptTimeoutMs(int timeoutMs) {
     if (timeoutMs < 0) {
         return Status::invalidArgument("accept timeout must be non-negative");
     }
+    acceptTimeoutMs_ = timeoutMs;
 
 #if defined(_WIN32)
     const auto nativeSocket = static_cast<SOCKET>(socket_);
@@ -449,6 +450,21 @@ Status TcpListener::accept(TcpStream& stream) const {
 
 #if defined(_WIN32)
     const auto nativeSocket = static_cast<SOCKET>(socket_);
+    if (acceptTimeoutMs_ > 0) {
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(nativeSocket, &readSet);
+        timeval timeout{};
+        timeout.tv_sec = acceptTimeoutMs_ / 1000;
+        timeout.tv_usec = (acceptTimeoutMs_ % 1000) * 1000;
+        const int ready = select(0, &readSet, nullptr, nullptr, &timeout);
+        if (ready == 0) {
+            return Status::unavailable("accept timed out");
+        }
+        if (ready < 0) {
+            return Status::unavailable(lastSocketError("select"));
+        }
+    }
     sockaddr_in peerAddress{};
     Socklen peerLength = sizeof(peerAddress);
     const auto accepted = ::accept(nativeSocket, reinterpret_cast<sockaddr*>(&peerAddress), &peerLength);
@@ -457,6 +473,21 @@ Status TcpListener::accept(TcpStream& stream) const {
     }
     stream = TcpStream(static_cast<TcpStream::NativeSocket>(accepted), endpointFromSockaddr(peerAddress));
 #else
+    if (acceptTimeoutMs_ > 0) {
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(socket_, &readSet);
+        timeval timeout{};
+        timeout.tv_sec = acceptTimeoutMs_ / 1000;
+        timeout.tv_usec = (acceptTimeoutMs_ % 1000) * 1000;
+        const int ready = select(socket_ + 1, &readSet, nullptr, nullptr, &timeout);
+        if (ready == 0) {
+            return Status::unavailable("accept timed out");
+        }
+        if (ready < 0) {
+            return Status::unavailable(lastSocketError("select"));
+        }
+    }
     sockaddr_in peerAddress{};
     Socklen peerLength = sizeof(peerAddress);
     const auto accepted = ::accept(socket_, reinterpret_cast<sockaddr*>(&peerAddress), &peerLength);
@@ -475,6 +506,7 @@ void TcpListener::close() {
     closeNativeSocket(socket_);
     socket_ = kInvalidSocket;
     localPort_ = 0;
+    acceptTimeoutMs_ = 0;
 }
 
 bool TcpListener::isOpen() const {

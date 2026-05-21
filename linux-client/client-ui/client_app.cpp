@@ -40,6 +40,7 @@ namespace {
 constexpr std::uint32_t kStartupReceiveTimeoutMs = 5000;
 constexpr std::uint32_t kActiveReceiveTimeoutMs = 1000;
 constexpr std::uint32_t kStartupIdleTimeouts = 12;
+constexpr std::uint32_t kMjpegActiveIdleTimeouts = 300;
 constexpr std::uint16_t kFrameAckPort = 17692;
 
 std::uint16_t parsePort(const char* value, std::uint16_t fallback) {
@@ -1049,7 +1050,10 @@ int runReceiveMjpegStreamMode(int argc, char** argv) {
             if (expectedFrames == 0) {
                 ++idleTimeouts;
                 if (frames > 0) {
-                    if (idleTimeouts < 6) {
+                    if (idleTimeouts < kMjpegActiveIdleTimeouts) {
+                        if ((idleTimeouts % 10) == 0) {
+                            led::logWarn("waiting for MJPEG stream to resume; keeping display session open");
+                        }
                         status = led::Status::ok();
                         continue;
                     }
