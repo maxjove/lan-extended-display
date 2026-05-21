@@ -287,6 +287,85 @@ bool renderGlFrame(
     return redrawGlBgrxScene(display, window, contextStorage, texture, width, height, drawCursor, cursorX, cursorY);
 }
 
+bool renderGlFrameRegion(
+    Display* display,
+    Window window,
+    void* contextStorage,
+    unsigned int& texture,
+    std::uint32_t& textureWidth,
+    std::uint32_t& textureHeight,
+    const std::uint8_t* data,
+    std::uint32_t canvasWidth,
+    std::uint32_t canvasHeight,
+    std::uint32_t regionX,
+    std::uint32_t regionY,
+    std::uint32_t regionWidth,
+    std::uint32_t regionHeight,
+    std::uint32_t stride,
+    bool drawCursor,
+    double cursorX,
+    double cursorY) {
+    auto context = static_cast<GLXContext>(contextStorage);
+    if (context == nullptr || !glXMakeCurrent(display, window, context)) {
+        return false;
+    }
+    if (regionX >= canvasWidth || regionY >= canvasHeight ||
+        regionX + regionWidth > canvasWidth || regionY + regionHeight > canvasHeight ||
+        regionWidth == 0 || regionHeight == 0) {
+        return false;
+    }
+
+    if (texture == 0) {
+        GLuint newTexture = 0;
+        glGenTextures(1, &newTexture);
+        texture = newTexture;
+    }
+
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+    if (textureWidth != canvasWidth || textureHeight != canvasHeight) {
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGBA,
+            static_cast<GLsizei>(canvasWidth),
+            static_cast<GLsizei>(canvasHeight),
+            0,
+            GL_BGRA,
+            GL_UNSIGNED_BYTE,
+            nullptr);
+        textureWidth = canvasWidth;
+        textureHeight = canvasHeight;
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, static_cast<GLint>(stride / 4));
+    glTexSubImage2D(
+        GL_TEXTURE_2D,
+        0,
+        static_cast<GLint>(regionX),
+        static_cast<GLint>(regionY),
+        static_cast<GLsizei>(regionWidth),
+        static_cast<GLsizei>(regionHeight),
+        GL_BGRA,
+        GL_UNSIGNED_BYTE,
+        data);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+
+    return redrawGlBgrxScene(
+        display,
+        window,
+        contextStorage,
+        texture,
+        canvasWidth,
+        canvasHeight,
+        drawCursor,
+        cursorX,
+        cursorY);
+}
+
 GLuint compileShader(GLenum type, const char* source) {
     const GLuint shader = glCreateShader(type);
     if (shader == 0) {
@@ -365,6 +444,67 @@ bool ensureYuvProgram(unsigned int& programStorage) {
     return true;
 }
 
+bool ensureNv12Program(unsigned int& programStorage) {
+    if (programStorage != 0) {
+        return true;
+    }
+
+    constexpr const char* vertexSource =
+        "varying vec2 vTex;\n"
+        "void main() {\n"
+        "  gl_Position = ftransform();\n"
+        "  vTex = gl_MultiTexCoord0.st;\n"
+        "}\n";
+    constexpr const char* fragmentSource =
+        "uniform sampler2D texY;\n"
+        "uniform sampler2D texUV;\n"
+        "varying vec2 vTex;\n"
+        "void main() {\n"
+        "  float y = texture2D(texY, vTex).r;\n"
+        "  vec4 uvSample = texture2D(texUV, vTex);\n"
+        "  float u = uvSample.r - 0.5;\n"
+        "  float v = uvSample.a - 0.5;\n"
+        "  vec3 rgb;\n"
+        "  rgb.r = y + 1.402 * v;\n"
+        "  rgb.g = y - 0.344136 * u - 0.714136 * v;\n"
+        "  rgb.b = y + 1.772 * u;\n"
+        "  gl_FragColor = vec4(rgb, 1.0);\n"
+        "}\n";
+
+    const GLuint vertex = compileShader(GL_VERTEX_SHADER, vertexSource);
+    const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, fragmentSource);
+    if (vertex == 0 || fragment == 0) {
+        if (vertex != 0) {
+            glDeleteShader(vertex);
+        }
+        if (fragment != 0) {
+            glDeleteShader(fragment);
+        }
+        return false;
+    }
+
+    const GLuint program = glCreateProgram();
+    glAttachShader(program, vertex);
+    glAttachShader(program, fragment);
+    glLinkProgram(program);
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
+
+    GLint linked = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (linked != GL_TRUE) {
+        glDeleteProgram(program);
+        return false;
+    }
+
+    glUseProgram(program);
+    glUniform1i(glGetUniformLocation(program, "texY"), 0);
+    glUniform1i(glGetUniformLocation(program, "texUV"), 1);
+    glUseProgram(0);
+    programStorage = program;
+    return true;
+}
+
 void uploadLumaTexture(
     GLenum unit,
     unsigned int& textureStorage,
@@ -406,6 +546,104 @@ void uploadLumaTexture(
         GL_LUMINANCE,
         GL_UNSIGNED_BYTE,
         data);
+}
+
+void uploadNv12UvTexture(
+    unsigned int& textureStorage,
+    std::uint32_t width,
+    std::uint32_t height,
+    const std::uint8_t* data,
+    bool allocate) {
+    if (textureStorage == 0) {
+        GLuint texture = 0;
+        glGenTextures(1, &texture);
+        textureStorage = texture;
+    }
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, textureStorage);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+    if (allocate) {
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_LUMINANCE_ALPHA,
+            static_cast<GLsizei>(width),
+            static_cast<GLsizei>(height),
+            0,
+            GL_LUMINANCE_ALPHA,
+            GL_UNSIGNED_BYTE,
+            data);
+        return;
+    }
+    glTexSubImage2D(
+        GL_TEXTURE_2D,
+        0,
+        0,
+        0,
+        static_cast<GLsizei>(width),
+        static_cast<GLsizei>(height),
+        GL_LUMINANCE_ALPHA,
+        GL_UNSIGNED_BYTE,
+        data);
+}
+
+bool renderGlNv12Frame(
+    Display* display,
+    Window window,
+    void* contextStorage,
+    unsigned int& yTexture,
+    unsigned int& uvTexture,
+    unsigned int& program,
+    std::uint32_t& textureWidth,
+    std::uint32_t& textureHeight,
+    const std::uint8_t* data,
+    std::uint64_t bytes,
+    std::uint32_t width,
+    std::uint32_t height,
+    bool drawCursor,
+    double cursorX,
+    double cursorY) {
+    if ((width % 2) != 0 || (height % 2) != 0) {
+        return false;
+    }
+    const auto yBytes = static_cast<std::uint64_t>(width) * height;
+    const auto uvBytes = yBytes / 2;
+    if (bytes < yBytes + uvBytes) {
+        return false;
+    }
+
+    auto context = static_cast<GLXContext>(contextStorage);
+    if (context == nullptr || !glXMakeCurrent(display, window, context)) {
+        return false;
+    }
+    if (!ensureNv12Program(program)) {
+        return false;
+    }
+
+    const auto* yPlane = data;
+    const auto* uvPlane = yPlane + yBytes;
+    const bool allocate = textureWidth != width || textureHeight != height;
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    uploadLumaTexture(GL_TEXTURE0, yTexture, width, height, yPlane, allocate);
+    uploadNv12UvTexture(uvTexture, width / 2, height / 2, uvPlane, allocate);
+    textureWidth = width;
+    textureHeight = height;
+    glActiveTexture(GL_TEXTURE0);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(program);
+    glEnable(GL_TEXTURE_2D);
+    drawFullFrameQuad();
+    glDisable(GL_TEXTURE_2D);
+    glUseProgram(0);
+    if (drawCursor) {
+        drawLocalCursor(cursorX, cursorY, width, height);
+    }
+    glXSwapBuffers(display, window);
+    return glGetError() == GL_NO_ERROR;
 }
 
 bool renderGlI420Frame(
@@ -621,11 +859,17 @@ led::Status Renderer::close() {
                 glDeleteProgram(program);
                 glYuvProgram_ = 0;
             }
-            GLuint yuvTextures[] = {glYTexture_, glUTexture_, glVTexture_};
-            glDeleteTextures(3, yuvTextures);
+            if (glNv12Program_ != 0) {
+                GLuint program = glNv12Program_;
+                glDeleteProgram(program);
+                glNv12Program_ = 0;
+            }
+            GLuint yuvTextures[] = {glYTexture_, glUTexture_, glVTexture_, glUvTexture_};
+            glDeleteTextures(4, yuvTextures);
             glYTexture_ = 0;
             glUTexture_ = 0;
             glVTexture_ = 0;
+            glUvTexture_ = 0;
             if (glTexture_ != 0) {
                 GLuint texture = glTexture_;
                 glDeleteTextures(1, &texture);
@@ -666,6 +910,20 @@ led::Status Renderer::updateLocalCursor(double normalizedX, double normalizedY) 
     localCursorX_ = std::clamp(normalizedX, 0.0, 1.0);
     localCursorY_ = std::clamp(normalizedY, 0.0, 1.0);
     localCursorVisible_ = true;
+#if defined(LED_HAS_X11) && defined(LED_HAS_GLX)
+    if (glAvailable_ && xDisplay_ != nullptr && xWindow_ != 0 && glTexture_ != 0) {
+        redrawGlBgrxScene(
+            static_cast<Display*>(xDisplay_),
+            xWindow_,
+            glContext_,
+            glTexture_,
+            glTextureWidth_ != 0 ? glTextureWidth_ : windowWidth_,
+            glTextureHeight_ != 0 ? glTextureHeight_ : windowHeight_,
+            localCursorVisible_,
+            localCursorX_,
+            localCursorY_);
+    }
+#endif
     return Status::ok();
 }
 
@@ -697,6 +955,26 @@ led::Status Renderer::submitRawFrameData(const RawFrameInfo& frame, const std::u
     const auto stride = frame.stride != 0 ? frame.stride : frame.width * 4;
 
 #if defined(LED_HAS_GLX)
+    if (glAvailable_ &&
+        frame.format == "NV12" &&
+        renderGlNv12Frame(
+            display,
+            xWindow_,
+            glContext_,
+            glYTexture_,
+            glUvTexture_,
+            glNv12Program_,
+            glYuvWidth_,
+            glYuvHeight_,
+            data,
+            frame.bytes,
+            width,
+            height,
+            localCursorVisible_,
+            localCursorX_,
+            localCursorY_)) {
+        return Status::ok();
+    }
     if (glAvailable_ &&
         frame.format == "I420" &&
         renderGlI420Frame(
@@ -779,6 +1057,89 @@ led::Status Renderer::submitRawFrameData(const RawFrameInfo& frame, const std::u
     XDestroyImage(image);
 #else
     (void)data;
+#endif
+    return Status::ok();
+}
+
+led::Status Renderer::submitRawFrameRegion(
+    const RawFrameInfo& frame,
+    const std::uint8_t* data,
+    std::uint32_t x,
+    std::uint32_t y) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++stats_.rawFrames;
+    stats_.bytes += frame.bytes;
+    stats_.lastFrame = frame;
+
+#if defined(LED_HAS_X11)
+    if (!fullscreen_ || xDisplay_ == nullptr || xWindow_ == 0 || xGc_ == nullptr || data == nullptr) {
+        return Status::ok();
+    }
+    if (frame.width == 0 || frame.height == 0 || frame.format != "BGRx") {
+        return Status::ok();
+    }
+    if (x >= windowWidth_ || y >= windowHeight_ || x + frame.width > windowWidth_ || y + frame.height > windowHeight_) {
+        return Status::invalidArgument("raw frame region is outside renderer canvas");
+    }
+
+    auto* display = static_cast<Display*>(xDisplay_);
+    const auto stride = frame.stride != 0 ? frame.stride : frame.width * 4;
+
+#if defined(LED_HAS_GLX)
+    if (glAvailable_ &&
+        renderGlFrameRegion(
+            display,
+            xWindow_,
+            glContext_,
+            glTexture_,
+            glTextureWidth_,
+            glTextureHeight_,
+            data,
+            windowWidth_,
+            windowHeight_,
+            x,
+            y,
+            frame.width,
+            frame.height,
+            stride,
+            localCursorVisible_,
+            localCursorX_,
+            localCursorY_)) {
+        return Status::ok();
+    }
+#endif
+
+#if defined(LED_HAS_XSHM)
+    if (xShmAvailable_ &&
+        ensureSharedImage(display, xScreen_, windowWidth_, windowHeight_, xShmImage_, xShmInfo_, xShmBytes_, xShmAttached_)) {
+        auto* image = static_cast<XImage*>(xShmImage_);
+        const auto* src = data;
+        auto* dst = reinterpret_cast<std::uint8_t*>(image->data) +
+            static_cast<std::size_t>(y) * image->bytes_per_line + static_cast<std::size_t>(x) * 4;
+        const auto copyBytes = frame.width * 4;
+        for (std::uint32_t row = 0; row < frame.height; ++row) {
+            std::memcpy(dst + row * image->bytes_per_line, src + row * stride, copyBytes);
+        }
+        XShmPutImage(
+            display,
+            xWindow_,
+            static_cast<GC>(xGc_),
+            image,
+            static_cast<int>(x),
+            static_cast<int>(y),
+            static_cast<int>(x),
+            static_cast<int>(y),
+            frame.width,
+            frame.height,
+            False);
+        XFlush(display);
+        return Status::ok();
+    }
+#endif
+#else
+    (void)data;
+    (void)x;
+    (void)y;
 #endif
     return Status::ok();
 }

@@ -11,12 +11,26 @@
 #include "led/protocol/messages.h"
 #include "led/session/session_state.h"
 #include "led/transport/h264_annex_b.h"
+#include "led/transport/mjpeg_packet.h"
 #include "led/transport/tcp_socket.h"
+#include "led/transport/udp_socket.h"
+
+#if defined(LED_HAS_LIBJPEG)
+#include <cstddef>
+#include <cstdio>
+extern "C" {
+#include <jpeglib.h>
+}
+#include <setjmp.h>
+#endif
 
 #include <chrono>
 #include <atomic>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -26,6 +40,7 @@ namespace {
 constexpr std::uint32_t kStartupReceiveTimeoutMs = 5000;
 constexpr std::uint32_t kActiveReceiveTimeoutMs = 1000;
 constexpr std::uint32_t kStartupIdleTimeouts = 12;
+constexpr std::uint16_t kFrameAckPort = 17692;
 
 std::uint16_t parsePort(const char* value, std::uint16_t fallback) {
     try {
@@ -45,6 +60,85 @@ std::uint32_t parseU32(const char* value, std::uint32_t fallback) {
     }
     return fallback;
 }
+
+void sendFrameAck(
+    led::transport::UdpSocket& socket,
+    const led::transport::UdpEndpoint& endpoint,
+    const char* stage,
+    std::uint64_t frameId,
+    std::uint64_t& lastAckedFrameId) {
+    if (frameId == 0 || frameId == lastAckedFrameId || !socket.isOpen()) {
+        return;
+    }
+    const auto message = std::string("LED_FRAME_ACK_V1;stage=") + stage + ";frame=" + std::to_string(frameId) + ";";
+    const std::vector<std::uint8_t> bytes(message.begin(), message.end());
+    const auto status = socket.sendTo(bytes, endpoint);
+    if (status.isOk()) {
+        lastAckedFrameId = frameId;
+    }
+}
+
+#if defined(LED_HAS_LIBJPEG)
+struct JpegDecodeError {
+    jpeg_error_mgr manager;
+    jmp_buf jumpBuffer;
+    char message[JMSG_LENGTH_MAX]{};
+};
+
+void onJpegDecodeError(j_common_ptr jpeg) {
+    auto* error = reinterpret_cast<JpegDecodeError*>(jpeg->err);
+    (*jpeg->err->format_message)(jpeg, error->message);
+    longjmp(error->jumpBuffer, 1);
+}
+
+led::Status decodeJpegToBgrx(
+    const std::vector<std::uint8_t>& jpegBytes,
+    std::uint64_t frameId,
+    led::client::RawFrameInfo& frame,
+    std::vector<std::uint8_t>& pixels) {
+    if (jpegBytes.empty()) {
+        return led::Status::invalidArgument("cannot decode empty JPEG frame");
+    }
+
+    jpeg_decompress_struct decoder{};
+    JpegDecodeError error{};
+    decoder.err = jpeg_std_error(&error.manager);
+    error.manager.error_exit = onJpegDecodeError;
+    if (setjmp(error.jumpBuffer) != 0) {
+        jpeg_destroy_decompress(&decoder);
+        return led::Status::internalError(std::string("JPEG decode failed: ") + error.message);
+    }
+
+    jpeg_create_decompress(&decoder);
+    jpeg_mem_src(
+        &decoder,
+        const_cast<unsigned char*>(reinterpret_cast<const unsigned char*>(jpegBytes.data())),
+        static_cast<unsigned long>(jpegBytes.size()));
+    jpeg_read_header(&decoder, TRUE);
+    decoder.out_color_space = JCS_EXT_BGRX;
+    jpeg_start_decompress(&decoder);
+
+    const auto width = static_cast<std::uint32_t>(decoder.output_width);
+    const auto height = static_cast<std::uint32_t>(decoder.output_height);
+    const auto stride = width * 4;
+    pixels.assign(static_cast<std::size_t>(stride) * height, 0);
+    while (decoder.output_scanline < decoder.output_height) {
+        auto* row = pixels.data() + static_cast<std::size_t>(decoder.output_scanline) * stride;
+        JSAMPROW rows[] = {row};
+        jpeg_read_scanlines(&decoder, rows, 1);
+    }
+    jpeg_finish_decompress(&decoder);
+    jpeg_destroy_decompress(&decoder);
+
+    frame.width = width;
+    frame.height = height;
+    frame.stride = stride;
+    frame.bytes = pixels.size();
+    frame.ptsNs = frameId * 1000000ULL;
+    frame.format = "BGRx";
+    return led::Status::ok();
+}
+#endif
 
 std::string sinkPipelineFromMode(const std::string& mode) {
     if (mode == "auto") {
@@ -98,12 +192,51 @@ std::string sinkPipelineFromMode(const std::string& mode) {
         return "avdec_h264 ! video/x-raw,format=I420 "
                "! fakesink name=decoded_sink signal-handoffs=true sync=false";
     }
+    if (mode == "vaapi-nv12gl") {
+        return "video/x-h264,stream-format=byte-stream,alignment=au "
+               "! vaapih264dec ! vaapipostproc ! video/x-raw,format=NV12 "
+               "! fakesink name=decoded_sink signal-handoffs=true sync=false";
+    }
+    if (mode == "vaapi-lowlatency-nv12gl") {
+        return "video/x-h264,stream-format=byte-stream,alignment=au "
+               "! vaapih264dec low-latency=true ! vaapipostproc ! video/x-raw,format=NV12 "
+               "! fakesink name=decoded_sink signal-handoffs=true sync=false";
+    }
+    if (mode == "vaapi-bin-nv12gl") {
+        return "video/x-h264,stream-format=byte-stream,alignment=au "
+               "! vaapidecodebin max-size-buffers=1 max-size-bytes=0 max-size-time=0 disable-vpp=true "
+               "! vaapipostproc ! video/x-raw,format=NV12 "
+               "! fakesink name=decoded_sink signal-handoffs=true sync=false";
+    }
+    if (mode == "vaapi-avc-nv12gl") {
+        return "video/x-h264,stream-format=avc,alignment=au "
+               "! vaapih264dec ! vaapipostproc ! video/x-raw,format=NV12 "
+               "! fakesink name=decoded_sink signal-handoffs=true sync=false";
+    }
+    if (mode == "vaapi-sink") {
+        return "video/x-h264,stream-format=byte-stream,alignment=au "
+               "! vaapih264dec ! vaapisink name=decoded_sink signal-handoffs=true sync=false fullscreen=true";
+    }
+    if (mode == "vaapi-lowlatency-sink") {
+        return "video/x-h264,stream-format=byte-stream,alignment=au "
+               "! vaapih264dec low-latency=true ! vaapisink name=decoded_sink signal-handoffs=true sync=false fullscreen=true";
+    }
     if (mode == "omx-i420gl") {
         return "avdec_h264_omx_dec ! videoconvert ! video/x-raw,format=I420 "
                "! fakesink name=decoded_sink signal-handoffs=true sync=false";
     }
+    if (mode == "omx-avc-i420gl") {
+        return "video/x-h264,stream-format=avc,alignment=au "
+               "! avdec_h264_omx_dec ! videoconvert ! video/x-raw,format=I420 "
+               "! fakesink name=decoded_sink signal-handoffs=true sync=false";
+    }
     if (mode == "ftomx-i420gl") {
         return "avdec_h264ftomx ! videoconvert ! video/x-raw,format=I420 "
+               "! fakesink name=decoded_sink signal-handoffs=true sync=false";
+    }
+    if (mode == "ftomx-avc-i420gl") {
+        return "video/x-h264,stream-format=avc,alignment=au "
+               "! avdec_h264ftomx ! videoconvert ! video/x-raw,format=I420 "
                "! fakesink name=decoded_sink signal-handoffs=true sync=false";
     }
     if (mode == "v4l2") {
@@ -352,7 +485,15 @@ int runReceiveTestStreamMode(int argc, char** argv) {
     led::client::Decoder decoder;
     const bool drawWithX11Raw =
         sinkMode == "avdec-x11raw" || sinkMode == "avdec-i420gl" ||
-        sinkMode == "omx-i420gl" || sinkMode == "ftomx-i420gl";
+        sinkMode == "vaapi-nv12gl" || sinkMode == "vaapi-lowlatency-nv12gl" ||
+        sinkMode == "vaapi-bin-nv12gl" || sinkMode == "vaapi-avc-nv12gl" ||
+        sinkMode == "omx-i420gl" || sinkMode == "ftomx-i420gl" ||
+        sinkMode == "omx-avc-i420gl" || sinkMode == "ftomx-avc-i420gl";
+    if (sinkMode == "vaapi-nv12gl" || sinkMode == "vaapi-lowlatency-nv12gl" ||
+        sinkMode == "vaapi-bin-nv12gl" || sinkMode == "vaapi-avc-nv12gl" || sinkMode == "vaapi-sink" ||
+        sinkMode == "vaapi-lowlatency-sink") {
+        setenv("LIBVA_DRIVER_NAME", "r600", 0);
+    }
     bool rendererOpened = false;
     decoder.setRenderer(&renderer);
     decoder.setSinkPipeline(sinkPipelineFromMode(sinkMode));
@@ -418,14 +559,42 @@ int runReceiveTestStreamMode(int argc, char** argv) {
     std::uint32_t receivedFrames = 0;
     std::uint64_t receivedBytes = 0;
     led::transport::UdpEndpoint source;
+    led::transport::UdpSocket frameAckSocket;
+    led::transport::UdpEndpoint frameAckEndpoint{hostAddress, kFrameAckPort};
+    auto ackStatus = frameAckSocket.open();
+    if (!ackStatus.isOk()) {
+        led::logWarn("frame ack telemetry disabled: " + ackStatus.message());
+    }
+    std::mutex frameAckMutex;
+    std::uint64_t lastReceiveAckedFrameId = 0;
+    std::uint64_t lastRenderAckedFrameId = 0;
+    decoder.setRenderedFrameCallback([&](std::uint64_t frameId) {
+        std::lock_guard<std::mutex> lock(frameAckMutex);
+        sendFrameAck(frameAckSocket, frameAckEndpoint, "render", frameId, lastRenderAckedFrameId);
+    });
     const auto start = std::chrono::steady_clock::now();
     auto lastStatsLog = start;
     std::uint32_t idleTimeouts = 0;
     bool activeTimeoutApplied = false;
     bool closedFromActiveIdle = false;
+    std::vector<std::vector<std::uint8_t>> accessUnitNalUnits;
+    std::uint64_t accessUnitFrameId = 0;
+    bool accessUnitHasFrameId = false;
+    auto flushAccessUnit = [&]() -> led::Status {
+        if (accessUnitNalUnits.empty()) {
+            return led::Status::ok();
+        }
+        auto flushStatus = accessUnitHasFrameId
+            ? decoder.pushAccessUnitWithFrameId(accessUnitNalUnits, accessUnitFrameId)
+            : decoder.pushAccessUnit(accessUnitNalUnits);
+        accessUnitNalUnits.clear();
+        accessUnitFrameId = 0;
+        accessUnitHasFrameId = false;
+        return flushStatus;
+    };
     while (expectedFrames == 0 || receivedFrames < expectedFrames) {
-        std::vector<std::uint8_t> nalUnit;
-        status = receiver.receiveNal(nalUnit, source);
+        led::client::ReceivedNal receivedNal;
+        status = receiver.receiveNal(receivedNal, source);
         if (!status.isOk()) {
             if (expectedFrames == 0 && isReceiveTimeoutStatus(status)) {
                 ++idleTimeouts;
@@ -444,16 +613,39 @@ int runReceiveTestStreamMode(int argc, char** argv) {
             if (inputThread.joinable()) {
                 inputThread.join();
             }
-            receiver.close();
-            decoder.stop();
-            if (rendererOpened) {
-                renderer.close();
+                receiver.close();
+                const auto flushStatus = flushAccessUnit();
+                if (!flushStatus.isOk()) {
+                    status = flushStatus;
+                    led::logError(status.message());
+                    return 1;
+                }
+                decoder.stop();
+                if (rendererOpened) {
+                    renderer.close();
             }
             led::logError(status.message());
             return 1;
         }
         idleTimeouts = 0;
-        status = decoder.pushNal(nalUnit);
+        const auto receivedNalBytes = receivedNal.nalUnit.size();
+        if (receivedNal.hasFrameId) {
+            std::lock_guard<std::mutex> lock(frameAckMutex);
+            sendFrameAck(frameAckSocket, frameAckEndpoint, "receive", receivedNal.frameId, lastReceiveAckedFrameId);
+        }
+        if (receivedNal.hasFrameId && accessUnitHasFrameId && accessUnitFrameId != receivedNal.frameId) {
+            status = flushAccessUnit();
+        }
+        if (status.isOk()) {
+            if (receivedNal.hasFrameId && accessUnitNalUnits.empty()) {
+                accessUnitFrameId = receivedNal.frameId;
+                accessUnitHasFrameId = true;
+            }
+            accessUnitNalUnits.push_back(std::move(receivedNal.nalUnit));
+            if (receivedNal.endOfFrame) {
+                status = flushAccessUnit();
+            }
+        }
         if (!status.isOk()) {
             stopInput = true;
             if (inputThread.joinable()) {
@@ -472,7 +664,7 @@ int runReceiveTestStreamMode(int argc, char** argv) {
             activeTimeoutApplied = true;
         }
         ++receivedFrames;
-        receivedBytes += nalUnit.size();
+        receivedBytes += receivedNalBytes;
 
         const auto now = std::chrono::steady_clock::now();
         if (now - lastStatsLog >= std::chrono::seconds(1)) {
@@ -486,13 +678,23 @@ int runReceiveTestStreamMode(int argc, char** argv) {
                       << " decoded=" << decoderLiveStats.decodedFrames
                       << " rendered=" << rendererLiveStats.rawFrames
                       << " drops=" << receiverLiveStats.depacketizerDrops
-                      << " sequence_gaps=" << receiverLiveStats.sequenceGaps << '\n';
+                      << " sequence_gaps=" << receiverLiveStats.sequenceGaps
+                      << " last_frame_id=" << receiverLiveStats.lastFrameId << '\n';
             lastStatsLog = now;
         }
     }
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const auto receiverStats = receiver.stats();
     receiver.close();
+    status = flushAccessUnit();
+    if (!status.isOk()) {
+        decoder.stop();
+        if (rendererOpened) {
+            renderer.close();
+        }
+        led::logError(status.message());
+        return 1;
+    }
     decoder.drainForMs(closedFromActiveIdle ? std::uint32_t{100} : drainMs);
     stopInput = true;
     if (inputThread.joinable()) {
@@ -501,6 +703,7 @@ int runReceiveTestStreamMode(int argc, char** argv) {
     const auto decoderStats = decoder.stats();
     const auto rendererStats = renderer.stats();
     decoder.stop();
+    frameAckSocket.close();
     if (rendererOpened) {
         renderer.close();
     }
@@ -649,6 +852,360 @@ int runDecodeH264FileMode(int argc, char** argv) {
     return 0;
 }
 
+int runReceiveMjpegStreamMode(int argc, char** argv) {
+    if (argc < 3) {
+        std::cerr << "Usage: led_client_app --receive-mjpeg-stream <host-ip> [control-port] [expected-frames] [drain-ms] [none|x11-input] [input-port]\n";
+        return 1;
+    }
+
+    const std::string hostAddress = argv[2];
+    const auto controlPort = argc >= 4 ? parsePort(argv[3], 17660) : std::uint16_t{17660};
+    const auto expectedFrames = argc >= 5 ? parseU32(argv[4], 0) : std::uint32_t{0};
+    const auto drainMs = argc >= 6 ? parseU32(argv[5], 100) : std::uint32_t{100};
+    const std::string inputMode = argc >= 7 ? argv[6] : "x11-input";
+    const auto inputPort = argc >= 8 ? parsePort(argv[7], 17691) : std::uint16_t{17691};
+
+    led::transport::TcpStream stream;
+    led::protocol::SessionOffer offer;
+    auto status = connectAndReceiveOffer(hostAddress, controlPort, stream, offer);
+    if (!status.isOk()) {
+        led::logError(status.message());
+        return 1;
+    }
+
+    led::transport::UdpSocket socket;
+    status = socket.bind(offer.rtpPort);
+    if (!status.isOk()) {
+        led::logError(status.message());
+        return 1;
+    }
+    socket.setReceiveTimeoutMs(kStartupReceiveTimeoutMs);
+
+    led::protocol::ClientReady ready;
+    ready.rtpPort = socket.localPort();
+    ready.sessionToken = offer.sessionToken;
+    status = stream.sendLine(led::protocol::serializeClientReady(ready));
+    if (!status.isOk()) {
+        socket.close();
+        led::logError(status.message());
+        return 1;
+    }
+
+    led::client::Renderer renderer;
+    led::client::Decoder decoder;
+#if !defined(LED_HAS_LIBJPEG)
+    decoder.setInputPipeline("image/jpeg", "");
+    decoder.setSinkPipeline("jpegdec ! videoconvert ! video/x-raw,format=BGRx ! fakesink name=decoded_sink signal-handoffs=true sync=false");
+    decoder.setRenderer(&renderer);
+    status = decoder.configure(offer.videoMode);
+    if (!status.isOk()) {
+        socket.close();
+        led::logError(status.message());
+        return 1;
+    }
+#endif
+    status = renderer.openFullscreen(offer.videoMode.resolution);
+    if (!status.isOk()) {
+        socket.close();
+        led::logError(status.message());
+        return 1;
+    }
+#if !defined(LED_HAS_LIBJPEG)
+    status = decoder.start();
+    if (!status.isOk()) {
+        renderer.close();
+        socket.close();
+        led::logError(status.message());
+        return 1;
+    }
+#else
+    led::logInfo("client MJPEG decoder using libjpeg-turbo direct BGRx path");
+#endif
+
+    std::atomic_bool stopInput{false};
+    led::client::X11InputCaptureStats inputStats;
+    led::Status inputStatus;
+    std::thread inputThread;
+    if (inputMode == "x11-input") {
+        led::client::X11InputCaptureOptions inputOptions;
+        inputOptions.hostAddress = hostAddress;
+        inputOptions.inputPort = inputPort;
+        inputOptions.hideLocalCursor = false;
+        inputOptions.renderer = &renderer;
+        inputThread = std::thread([&]() {
+            led::client::X11InputCapture capture;
+            inputStatus = capture.run(inputOptions, &stopInput, inputStats);
+        });
+    } else if (inputMode != "none") {
+#if !defined(LED_HAS_LIBJPEG)
+        decoder.stop();
+#endif
+        renderer.close();
+        socket.close();
+        std::cerr << "Unsupported input mode: " << inputMode << '\n';
+        return 1;
+    }
+
+    led::transport::UdpSocket frameAckSocket;
+    led::transport::UdpEndpoint frameAckEndpoint{hostAddress, kFrameAckPort};
+    auto ackStatus = frameAckSocket.open();
+    if (!ackStatus.isOk()) {
+        led::logWarn("frame ack telemetry disabled: " + ackStatus.message());
+    }
+    std::mutex frameAckMutex;
+    std::uint64_t lastReceiveAckedFrameId = 0;
+    std::uint64_t lastRenderAckedFrameId = 0;
+    std::atomic<std::uint64_t> lastSubmittedFrameId{0};
+    std::atomic<std::uint64_t> lastRenderedFrameId{0};
+    decoder.setRenderedFrameCallback([&](std::uint64_t frameId) {
+        lastRenderedFrameId.store(frameId, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(frameAckMutex);
+        sendFrameAck(frameAckSocket, frameAckEndpoint, "render", frameId, lastRenderAckedFrameId);
+    });
+
+    led::transport::MjpegFrameAssembler assembler;
+    led::transport::UdpEndpoint source;
+    std::vector<std::uint8_t> datagramBytes;
+    std::uint32_t frames = 0;
+    std::uint64_t packets = 0;
+    std::uint64_t malformed = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t decodeDropped = 0;
+    std::atomic<std::uint64_t> directDecodedFrames{0};
+    std::uint32_t idleTimeouts = 0;
+    bool activeTimeoutApplied = false;
+    bool closedFromActiveIdle = false;
+    const auto start = std::chrono::steady_clock::now();
+    auto lastStatsLog = start;
+
+#if defined(LED_HAS_LIBJPEG)
+    std::mutex latestFrameMutex;
+    std::condition_variable latestFrameCv;
+    led::transport::ReassembledMjpegFrame latestFrame;
+    bool latestFrameAvailable = false;
+    bool latestFrameStop = false;
+    led::Status directDecodeStatus = led::Status::ok();
+    std::thread directDecodeThread([&]() {
+        std::vector<std::uint8_t> pixels;
+        bool receivedKeyFrame = false;
+        while (true) {
+            led::transport::ReassembledMjpegFrame frameToDecode;
+            {
+                std::unique_lock<std::mutex> lock(latestFrameMutex);
+                latestFrameCv.wait(lock, [&]() { return latestFrameStop || latestFrameAvailable; });
+                if (latestFrameStop && !latestFrameAvailable) {
+                    break;
+                }
+                frameToDecode = std::move(latestFrame);
+                latestFrameAvailable = false;
+            }
+            const auto canvasWidth = frameToDecode.canvasWidth != 0
+                ? frameToDecode.canvasWidth
+                : offer.videoMode.resolution.width;
+            const auto canvasHeight = frameToDecode.canvasHeight != 0
+                ? frameToDecode.canvasHeight
+                : offer.videoMode.resolution.height;
+            const auto rectWidth = frameToDecode.rectWidth != 0 ? frameToDecode.rectWidth : canvasWidth;
+            const auto rectHeight = frameToDecode.rectHeight != 0 ? frameToDecode.rectHeight : canvasHeight;
+            const bool keyFrame = frameToDecode.keyFrame ||
+                (frameToDecode.rectX == 0 && frameToDecode.rectY == 0 &&
+                 rectWidth == canvasWidth && rectHeight == canvasHeight);
+            if (!keyFrame && !receivedKeyFrame) {
+                continue;
+            }
+
+            led::client::RawFrameInfo rawFrame;
+            auto decodeStatus = decodeJpegToBgrx(frameToDecode.jpegBytes, frameToDecode.frameId, rawFrame, pixels);
+            if (!decodeStatus.isOk()) {
+                directDecodeStatus = decodeStatus;
+                break;
+            }
+            if (rawFrame.width != rectWidth || rawFrame.height != rectHeight) {
+                directDecodeStatus = led::Status::internalError("decoded MJPEG rect size does not match packet metadata");
+                break;
+            }
+            if (keyFrame) {
+                decodeStatus = renderer.submitRawFrameData(rawFrame, pixels.data());
+                receivedKeyFrame = decodeStatus.isOk();
+            } else {
+                decodeStatus = renderer.submitRawFrameRegion(rawFrame, pixels.data(), frameToDecode.rectX, frameToDecode.rectY);
+            }
+            if (!decodeStatus.isOk()) {
+                directDecodeStatus = decodeStatus;
+                break;
+            }
+            directDecodedFrames.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(frameAckMutex);
+                sendFrameAck(frameAckSocket, frameAckEndpoint, "render", frameToDecode.frameId, lastRenderAckedFrameId);
+            }
+        }
+    });
+#endif
+
+    while (expectedFrames == 0 || frames < expectedFrames) {
+        status = socket.receiveFrom(65535, datagramBytes, source);
+        if (!status.isOk()) {
+            if (expectedFrames == 0) {
+                ++idleTimeouts;
+                if (frames > 0) {
+                    if (idleTimeouts < 6) {
+                        status = led::Status::ok();
+                        continue;
+                    }
+                    closedFromActiveIdle = true;
+                    status = led::Status::ok();
+                    break;
+                }
+                if (idleTimeouts < kStartupIdleTimeouts) {
+                    led::logWarn("waiting for first MJPEG frame; keeping display session open");
+                    continue;
+                }
+            }
+            break;
+        }
+        idleTimeouts = 0;
+        ++packets;
+
+        led::transport::MjpegDatagram datagram;
+        status = led::transport::parseMjpegDatagram(datagramBytes, datagram);
+        if (!status.isOk()) {
+            ++malformed;
+            status = led::Status::ok();
+            continue;
+        }
+        led::transport::ReassembledMjpegFrame frame;
+        status = assembler.pushDatagram(datagram, frame);
+        if (!status.isOk()) {
+            ++malformed;
+            status = led::Status::ok();
+            continue;
+        }
+        if (frame.jpegBytes.empty()) {
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(frameAckMutex);
+            sendFrameAck(frameAckSocket, frameAckEndpoint, "receive", frame.frameId, lastReceiveAckedFrameId);
+        }
+        if (!activeTimeoutApplied) {
+            socket.setReceiveTimeoutMs(kActiveReceiveTimeoutMs);
+            activeTimeoutApplied = true;
+        }
+        ++frames;
+        bytes += frame.jpegBytes.size();
+
+#if defined(LED_HAS_LIBJPEG)
+        {
+            std::lock_guard<std::mutex> lock(latestFrameMutex);
+            if (latestFrameAvailable) {
+                ++decodeDropped;
+            }
+            latestFrame = std::move(frame);
+            latestFrameAvailable = true;
+        }
+        latestFrameCv.notify_one();
+#else
+        const auto submittedFrameId = lastSubmittedFrameId.load(std::memory_order_acquire);
+        const auto renderedFrameId = lastRenderedFrameId.load(std::memory_order_acquire);
+        if (submittedFrameId != 0 && renderedFrameId < submittedFrameId) {
+            ++decodeDropped;
+        } else {
+            status = decoder.pushEncodedBufferWithFrameId(frame.jpegBytes, frame.frameId);
+            if (!status.isOk()) {
+                break;
+            }
+            lastSubmittedFrameId.store(frame.frameId, std::memory_order_release);
+        }
+#endif
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastStatsLog >= std::chrono::seconds(1)) {
+#if defined(LED_HAS_LIBJPEG)
+            const auto rendererLiveStats = renderer.stats();
+            const auto decodedFrames = directDecodedFrames.load(std::memory_order_relaxed);
+#else
+            const auto decoderLiveStats = decoder.stats();
+            const auto rendererLiveStats = renderer.stats();
+            const auto decodedFrames = decoderLiveStats.decodedFrames;
+#endif
+            std::cout << "Client MJPEG live stats: frames=" << frames
+                      << " packets=" << packets
+                        << " malformed=" << malformed
+                        << " decode_dropped=" << decodeDropped
+                        << " decoded=" << decodedFrames
+                        << " rendered=" << rendererLiveStats.rawFrames
+                        << " avg_frame_kb=" << (frames == 0 ? 0 : (bytes / 1024 / frames))
+                      << " last_frame_id=" << frame.frameId << '\n';
+            lastStatsLog = now;
+        }
+    }
+
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    socket.close();
+#if defined(LED_HAS_LIBJPEG)
+    {
+        std::lock_guard<std::mutex> lock(latestFrameMutex);
+        latestFrameAvailable = false;
+        latestFrameStop = true;
+    }
+    latestFrameCv.notify_one();
+    if (directDecodeThread.joinable()) {
+        directDecodeThread.join();
+    }
+    if (status.isOk() && !directDecodeStatus.isOk()) {
+        status = directDecodeStatus;
+    }
+    (void)closedFromActiveIdle;
+    (void)drainMs;
+    const auto decoderStats = decoder.stats();
+#else
+    decoder.drainForMs(closedFromActiveIdle ? std::uint32_t{100} : drainMs);
+    const auto decoderStats = decoder.stats();
+#endif
+    const auto rendererStats = renderer.stats();
+#if !defined(LED_HAS_LIBJPEG)
+    decoder.stop();
+#endif
+    stopInput = true;
+    if (inputThread.joinable()) {
+        inputThread.join();
+    }
+    if (status.isOk() && !inputStatus.isOk()) {
+        status = inputStatus;
+    }
+    frameAckSocket.close();
+    renderer.close();
+    if (!status.isOk()) {
+        led::logError(status.message());
+        return 1;
+    }
+
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    const auto fps = elapsedMs > 0 ? (static_cast<double>(frames) * 1000.0 / static_cast<double>(elapsedMs)) : 0.0;
+    std::cout << "Received MJPEG stream frames=" << frames
+                << " packets=" << packets
+                << " malformed=" << malformed
+                << " decode_dropped=" << decodeDropped
+                << " bytes=" << bytes
+              << " elapsed_ms=" << elapsedMs
+              << " fps=" << fps
+              << " from " << source.address << ':' << source.port << '\n';
+    std::cout << "Decoder sink stats: buffers=" << decoderStats.nalUnits
+              << " bytes=" << decoderStats.bytes
+              << " decoded_frames=" << decoderStats.decodedFrames
+              << " backend=" << decoder.backendName()
+              << " backend_accepted=" << decoderStats.backendAccepted << '\n';
+    std::cout << "Renderer stats: raw_frames=" << rendererStats.rawFrames
+              << " bytes=" << rendererStats.bytes
+              << " last=" << rendererStats.lastFrame.width << 'x'
+              << rendererStats.lastFrame.height
+              << " format=" << rendererStats.lastFrame.format
+              << " last_bytes=" << rendererStats.lastFrame.bytes << '\n';
+    return 0;
+}
+
 int runSendTestInputMode(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "Usage: led_client_app --send-test-input <host-ip> [input-port] [count] [interval-ms] [move|mouse|keyboard|mixed]\n";
@@ -786,6 +1343,9 @@ int main(int argc, char** argv) {
     }
     if (argc >= 2 && std::string(argv[1]) == "--receive-test-stream") {
         return runReceiveTestStreamMode(argc, argv);
+    }
+    if (argc >= 2 && std::string(argv[1]) == "--receive-mjpeg-stream") {
+        return runReceiveMjpegStreamMode(argc, argv);
     }
     if (argc >= 2 && std::string(argv[1]) == "--decode-h264-file") {
         return runDecodeH264FileMode(argc, argv);

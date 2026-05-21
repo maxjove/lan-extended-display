@@ -56,11 +56,21 @@ Status VideoReceiver::setReceiveTimeoutMs(std::uint32_t timeoutMs) {
 }
 
 Status VideoReceiver::receiveNal(std::vector<std::uint8_t>& nalUnit, transport::UdpEndpoint& source) {
+    ReceivedNal received;
+    auto status = receiveNal(received, source);
+    if (!status.isOk()) {
+        return status;
+    }
+    nalUnit = std::move(received.nalUnit);
+    return Status::ok();
+}
+
+Status VideoReceiver::receiveNal(ReceivedNal& nal, transport::UdpEndpoint& source) {
     if (!bound_) {
         return Status::invalidState("cannot receive video before binding UDP socket");
     }
 
-    nalUnit.clear();
+    nal = {};
     for (;;) {
         std::vector<std::uint8_t> bytes;
         auto status = socket_.receiveFrom(1500, bytes, source);
@@ -84,8 +94,16 @@ Status VideoReceiver::receiveNal(std::vector<std::uint8_t>& nalUnit, transport::
         }
 
         if (!reassembled.nalUnit.empty()) {
-            nalUnit = std::move(reassembled.nalUnit);
-            noteNal(nalUnit);
+            nal.nalUnit = std::move(reassembled.nalUnit);
+            nal.rtpTimestamp = reassembled.timestamp;
+            nal.endOfFrame = reassembled.endOfFrame;
+            nal.frameId = reassembled.frameId;
+            nal.hasFrameId = reassembled.hasFrameId;
+            noteNal(nal.nalUnit);
+            if (nal.hasFrameId) {
+                stats_.lastFrameId = nal.frameId;
+                stats_.hasLastFrameId = true;
+            }
             return Status::ok();
         }
     }

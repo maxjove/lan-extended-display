@@ -34,6 +34,9 @@ constexpr int kMenuManualIp = 1004;
 constexpr int kMenuRefreshDevices = 1005;
 constexpr int kMenuOpenLog = 1006;
 constexpr int kMenuInstallFirewall = 1007;
+constexpr int kMenuQuality45 = 1010;
+constexpr int kMenuQuality55 = 1011;
+constexpr int kMenuQuality65 = 1012;
 constexpr int kMenuDeviceBase = 2000;
 constexpr int kMaxDeviceMenuItems = 64;
 constexpr UINT_PTR kMonitorTimerId = 2001;
@@ -58,6 +61,8 @@ std::atomic_bool g_discoveryStop{false};
 std::thread g_discoveryThread;
 std::mutex g_devicesMutex;
 HICON g_trayIcon{nullptr};
+int g_jpegQuality = 55;
+std::uint64_t g_hostGeneration = 0;
 
 struct ClientDevice {
     std::string address;
@@ -525,6 +530,31 @@ bool runElevatedPowerShellScript(HWND window, const std::wstring& scriptPath) {
     return true;
 }
 
+std::wstring trayConfigPath() {
+    return executableDirectory() + L"\\led_host_tray.ini";
+}
+
+int normalizeJpegQuality(int quality) {
+    if (quality == 45 || quality == 55 || quality == 65) {
+        return quality;
+    }
+    return 55;
+}
+
+void loadTraySettings() {
+    g_jpegQuality = normalizeJpegQuality(GetPrivateProfileIntW(
+        L"video",
+        L"jpeg_quality",
+        55,
+        trayConfigPath().c_str()));
+}
+
+void saveTraySettings() {
+    wchar_t value[16]{};
+    swprintf_s(value, L"%d", normalizeJpegQuality(g_jpegQuality));
+    WritePrivateProfileStringW(L"video", L"jpeg_quality", value, trayConfigPath().c_str());
+}
+
 bool installVirtualDisplay(HWND window) {
     return runElevatedPowerShellScript(window, driverScriptPath(L"install-driver.ps1"));
 }
@@ -542,7 +572,8 @@ bool installFirewallRules(HWND window) {
         L"@{Name='LAN Extended Display Discovery';Protocol='UDP';Port='17659'},"
         L"@{Name='LAN Extended Display Control';Protocol='TCP';Port='17660'},"
         L"@{Name='LAN Extended Display Video';Protocol='UDP';Port='17670'},"
-        L"@{Name='LAN Extended Display Input';Protocol='UDP';Port='17691'}"
+        L"@{Name='LAN Extended Display Input';Protocol='UDP';Port='17691'},"
+        L"@{Name='LAN Extended Display Telemetry';Protocol='UDP';Port='17692'}"
         L");"
         L"foreach($rule in $rules){"
         L"  if(-not (Get-NetFirewallRule -DisplayName $rule.Name -ErrorAction SilentlyContinue)){"
@@ -727,7 +758,9 @@ bool startHost(HWND window) {
     const auto hostExe = executableDirectory() + L"\\led_host_app.exe";
     std::wstring command =
         quote(hostExe) +
-        L" --serve-live-capture 17660 17670 17691 0 60 sendinput 20000 1920 1080";
+        L" --serve-mjpeg-capture 17660 17670 0 60 " +
+        std::to_wstring(normalizeJpegQuality(g_jpegQuality)) +
+        L" 1920 1080 17691 sendinput";
 
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
@@ -791,7 +824,8 @@ bool startHost(HWND window) {
 
     g_host.process = process;
     g_host.started = true;
-    logTray(L"host process started pid=%lu", process.dwProcessId);
+    const auto hostGeneration = ++g_hostGeneration;
+    logTray(L"host process started pid=%lu jpeg_quality=%d", process.dwProcessId, normalizeJpegQuality(g_jpegQuality));
     if (WaitForSingleObject(g_host.process.hProcess, 1200) != WAIT_TIMEOUT) {
         DWORD exitCode = 1;
         GetExitCodeProcess(g_host.process.hProcess, &exitCode);
@@ -809,10 +843,10 @@ bool startHost(HWND window) {
             SYNCHRONIZE,
             FALSE,
             0)) {
-        std::thread([waitHandle, window]() {
+        std::thread([waitHandle, window, hostGeneration]() {
             WaitForSingleObject(waitHandle, INFINITE);
             CloseHandle(waitHandle);
-            PostMessageW(window, kHostExitedMessage, 0, 0);
+            PostMessageW(window, kHostExitedMessage, static_cast<WPARAM>(hostGeneration), 0);
         }).detach();
     }
     return true;
@@ -859,6 +893,23 @@ void stopExtendedDisplay(HWND window) {
     removeVirtualDisplayIfInstalled(window);
     logTray(L"stop command completed");
     showBalloon(window, L"Extended display stopped", L"The virtual display removal was requested.");
+}
+
+void setJpegQuality(HWND window, int quality) {
+    g_jpegQuality = normalizeJpegQuality(quality);
+    saveTraySettings();
+    const bool running = hostStillRunning() || g_virtualDisplayInstalled;
+    logTray(L"jpeg quality set to %d running=%ls", g_jpegQuality, running ? L"true" : L"false");
+    if (!running) {
+        showBalloon(window, L"Quality set", L"The selected quality will be used for the next start.");
+        return;
+    }
+
+    const std::string targetIp = g_selectedClientIp;
+    showBalloon(window, L"Applying quality", L"Restarting the current display session with the new quality.");
+    stopExtendedDisplay(window);
+    Sleep(500);
+    startExtendedDisplay(window, targetIp);
 }
 
 void addTrayIcon(HWND window) {
@@ -1009,6 +1060,8 @@ void showTrayMenu(HWND window) {
 
     HMENU menu = CreatePopupMenu();
     std::wstring status = busy ? L"Status: running" : L"Status: stopped";
+    status += L"  Quality: ";
+    status += std::to_wstring(normalizeJpegQuality(g_jpegQuality));
     if (!g_selectedClientIp.empty()) {
         status += L"  Target: ";
         status += utf8ToWide(g_selectedClientIp);
@@ -1029,6 +1082,12 @@ void showTrayMenu(HWND window) {
     }
     AppendMenuW(menu, MF_POPUP | (busy ? MF_GRAYED : 0), reinterpret_cast<UINT_PTR>(devicesMenu), L"Start discovered client");
     AppendMenuW(menu, MF_STRING, kMenuRefreshDevices, L"Refresh clients");
+    HMENU qualityMenu = CreatePopupMenu();
+    const int quality = normalizeJpegQuality(g_jpegQuality);
+    AppendMenuW(qualityMenu, MF_STRING | (quality == 45 ? MF_CHECKED : 0), kMenuQuality45, L"Fast 45");
+    AppendMenuW(qualityMenu, MF_STRING | (quality == 55 ? MF_CHECKED : 0), kMenuQuality55, L"Balanced 55");
+    AppendMenuW(qualityMenu, MF_STRING | (quality == 65 ? MF_CHECKED : 0), kMenuQuality65, L"Sharp 65");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(qualityMenu), L"Quality");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (busy ? 0 : MF_GRAYED), kMenuStop, L"Stop extended display");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -1058,6 +1117,13 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         }
         break;
     case kHostExitedMessage:
+        if (static_cast<std::uint64_t>(wParam) != g_hostGeneration) {
+            logTray(
+                L"ignored stale host exit message generation=%llu current=%llu",
+                static_cast<unsigned long long>(wParam),
+                static_cast<unsigned long long>(g_hostGeneration));
+            return 0;
+        }
         hostStillRunning();
         if (g_virtualDisplayInstalled) {
             showBalloon(window, L"Extended display ended", L"Host stopped. Removing the virtual display.");
@@ -1093,6 +1159,15 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kMenuRefreshDevices:
             sendDiscoveryProbe();
             showBalloon(window, L"Scanning", L"Looking for Linux extended display clients on the LAN.");
+            return 0;
+        case kMenuQuality45:
+            setJpegQuality(window, 45);
+            return 0;
+        case kMenuQuality55:
+            setJpegQuality(window, 55);
+            return 0;
+        case kMenuQuality65:
+            setJpegQuality(window, 65);
             return 0;
         case kMenuInstallFirewall:
             if (installFirewallRules(window)) {
@@ -1146,6 +1221,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    loadTraySettings();
     logTray(L"tray process starting");
     WNDCLASSW windowClass{};
     windowClass.lpfnWndProc = windowProc;

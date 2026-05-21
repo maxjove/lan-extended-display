@@ -32,7 +32,11 @@ Status VideoSender::open(const transport::UdpEndpoint& endpoint) {
     return Status::ok();
 }
 
-Status VideoSender::sendNal(const std::vector<std::uint8_t>& nalUnit, std::uint32_t rtpTimestamp) {
+Status VideoSender::sendNal(
+    const std::vector<std::uint8_t>& nalUnit,
+    std::uint32_t rtpTimestamp,
+    std::uint64_t frameId,
+    bool markerOnLastPacket) {
     if (!open_) {
         return Status::invalidState("cannot send video before sender is open");
     }
@@ -40,7 +44,7 @@ Status VideoSender::sendNal(const std::vector<std::uint8_t>& nalUnit, std::uint3
         return Status::invalidArgument("cannot send an empty H.264 NAL");
     }
 
-    auto packets = packetizer_.packetizeNal(nalUnit, rtpTimestamp, maxPayloadSize_);
+    auto packets = packetizer_.packetizeNal(nalUnit, rtpTimestamp, maxPayloadSize_, markerOnLastPacket);
     if (packets.empty()) {
         return Status::invalidArgument("H.264 NAL could not be packetized");
     }
@@ -49,7 +53,9 @@ Status VideoSender::sendNal(const std::vector<std::uint8_t>& nalUnit, std::uint3
         if (embedSendTime_) {
             packet.hasExtension = true;
             packet.extensionProfile = transport::kLedRtpExtensionProfile;
-            packet.extensionData = transport::makeSendTimeExtension(currentUnixTimeUs());
+            packet.extensionData = frameId != 0
+                ? transport::makeTelemetryExtension(currentUnixTimeUs(), frameId)
+                : transport::makeSendTimeExtension(currentUnixTimeUs());
         }
         const auto bytes = transport::serializeRtpPacket(packet);
         auto status = socket_.sendTo(bytes, endpoint_);
@@ -63,8 +69,9 @@ Status VideoSender::sendNal(const std::vector<std::uint8_t>& nalUnit, std::uint3
 Status VideoSender::sendFrame(const EncodedFrame& frame) {
     const auto timestamp = rtpTimestampFromMicroseconds(frame.timestampUs);
     if (!frame.nalUnits.empty()) {
-        for (const auto& nalUnit : frame.nalUnits) {
-            auto status = sendNal(nalUnit, timestamp);
+        for (std::size_t index = 0; index < frame.nalUnits.size(); ++index) {
+            const bool markerOnLastPacket = index + 1 == frame.nalUnits.size();
+            auto status = sendNal(frame.nalUnits[index], timestamp, frame.frameId, markerOnLastPacket);
             if (!status.isOk()) {
                 return status;
             }
@@ -74,7 +81,7 @@ Status VideoSender::sendFrame(const EncodedFrame& frame) {
     if (frame.payload.empty()) {
         return Status::ok();
     }
-    return sendNal(frame.payload, timestamp);
+    return sendNal(frame.payload, timestamp, frame.frameId);
 }
 
 Status VideoSender::close() {

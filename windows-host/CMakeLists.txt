@@ -5,6 +5,7 @@ add_library(led_host_core
     host-core/src/encoder.cpp
     host-core/src/input_injector.cpp
     host-core/src/input_receiver.cpp
+    host-core/src/jpeg_encoder.cpp
     host-core/src/signaling_server.cpp
     host-core/src/session_manager.cpp
     host-core/src/video_sender.cpp)
@@ -43,6 +44,7 @@ if(MSVC)
         mf
         mfuuid
         wmcodecdspuuid
+        gdiplus
         d3d11
         dxgi
         ole32)

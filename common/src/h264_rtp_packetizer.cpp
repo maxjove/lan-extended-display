@@ -17,7 +17,8 @@ H264RtpPacketizer::H264RtpPacketizer(std::uint32_t ssrc, std::uint16_t initialSe
 std::vector<RtpPacket> H264RtpPacketizer::packetizeNal(
     const std::vector<std::uint8_t>& nalUnit,
     std::uint32_t timestamp,
-    std::size_t maxPayloadSize) {
+    std::size_t maxPayloadSize,
+    bool markerOnLastPacket) {
     std::vector<RtpPacket> packets;
     if (nalUnit.empty() || maxPayloadSize == 0) {
         return packets;
@@ -25,7 +26,7 @@ std::vector<RtpPacket> H264RtpPacketizer::packetizeNal(
 
     if (nalUnit.size() <= maxPayloadSize) {
         RtpPacket packet;
-        packet.marker = true;
+        packet.marker = markerOnLastPacket;
         packet.sequenceNumber = allocateSequence();
         packet.timestamp = timestamp;
         packet.ssrc = ssrc_;
@@ -52,7 +53,7 @@ std::vector<RtpPacket> H264RtpPacketizer::packetizeNal(
         const bool last = offset + fragmentSize >= nalUnit.size();
 
         RtpPacket packet;
-        packet.marker = last;
+        packet.marker = last && markerOnLastPacket;
         packet.sequenceNumber = allocateSequence();
         packet.timestamp = timestamp;
         packet.ssrc = ssrc_;

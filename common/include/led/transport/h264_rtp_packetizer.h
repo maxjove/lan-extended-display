@@ -25,7 +25,8 @@ public:
     [[nodiscard]] std::vector<RtpPacket> packetizeNal(
         const std::vector<std::uint8_t>& nalUnit,
         std::uint32_t timestamp,
-        std::size_t maxPayloadSize);
+        std::size_t maxPayloadSize,
+        bool markerOnLastPacket = true);
 
     [[nodiscard]] std::uint16_t nextSequenceNumber() const;
 

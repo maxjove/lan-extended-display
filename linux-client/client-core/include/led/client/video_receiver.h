@@ -27,6 +27,16 @@ struct VideoReceiverStats {
     double jitterUs{0.0};
     std::uint16_t lastSequenceNumber{0};
     std::uint32_t lastTimestamp{0};
+    std::uint64_t lastFrameId{0};
+    bool hasLastFrameId{false};
+};
+
+struct ReceivedNal {
+    std::vector<std::uint8_t> nalUnit;
+    std::uint32_t rtpTimestamp{0};
+    bool endOfFrame{false};
+    std::uint64_t frameId{0};
+    bool hasFrameId{false};
 };
 
 class VideoReceiver {
@@ -34,6 +44,7 @@ public:
     Status bind(std::uint16_t port);
     Status setReceiveTimeoutMs(std::uint32_t timeoutMs);
     Status receiveNal(std::vector<std::uint8_t>& nalUnit, transport::UdpEndpoint& source);
+    Status receiveNal(ReceivedNal& nal, transport::UdpEndpoint& source);
     Status close();
 
     [[nodiscard]] std::uint16_t port() const;

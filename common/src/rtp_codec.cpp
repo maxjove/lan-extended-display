@@ -8,6 +8,7 @@ namespace led::transport {
 namespace {
 
 constexpr std::uint8_t kSendTimeExtensionId = 1;
+constexpr std::uint8_t kFrameIdExtensionId = 2;
 
 void writeU16(std::vector<std::uint8_t>& bytes, std::uint16_t value) {
     bytes.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
@@ -126,6 +127,14 @@ std::vector<std::uint8_t> makeSendTimeExtension(std::uint64_t sendTimeUs) {
     return extension;
 }
 
+std::vector<std::uint8_t> makeTelemetryExtension(std::uint64_t sendTimeUs, std::uint64_t frameId) {
+    auto extension = makeSendTimeExtension(sendTimeUs);
+    extension.push_back(kFrameIdExtensionId);
+    extension.push_back(8);
+    writeU64(extension, frameId);
+    return extension;
+}
+
 bool parseSendTimeExtension(const RtpPacket& packet, std::uint64_t& sendTimeUs) {
     if (!packet.hasExtension || packet.extensionProfile != kLedRtpExtensionProfile) {
         return false;
@@ -144,6 +153,31 @@ bool parseSendTimeExtension(const RtpPacket& packet, std::uint64_t& sendTimeUs) 
         }
         if (id == kSendTimeExtensionId && length == 8) {
             sendTimeUs = readU64(packet.extensionData, offset);
+            return true;
+        }
+        offset += length;
+    }
+    return false;
+}
+
+bool parseFrameIdExtension(const RtpPacket& packet, std::uint64_t& frameId) {
+    if (!packet.hasExtension || packet.extensionProfile != kLedRtpExtensionProfile) {
+        return false;
+    }
+
+    std::size_t offset = 0;
+    while (offset + 2 <= packet.extensionData.size()) {
+        const auto id = packet.extensionData[offset];
+        const auto length = packet.extensionData[offset + 1];
+        offset += 2;
+        if (id == 0 && length == 0) {
+            break;
+        }
+        if (offset + length > packet.extensionData.size()) {
+            return false;
+        }
+        if (id == kFrameIdExtensionId && length == 8) {
+            frameId = readU64(packet.extensionData, offset);
             return true;
         }
         offset += length;

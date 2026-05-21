@@ -3,6 +3,7 @@
 #include "led/host/cursor_suppressor.h"
 #include "led/host/input_injector.h"
 #include "led/host/input_receiver.h"
+#include "led/host/jpeg_encoder.h"
 #include "led/host/signaling_server.h"
 #include "led/host/session_manager.h"
 #include "led/host/video_sender.h"
@@ -10,14 +11,22 @@
 #include "led/protocol/messages.h"
 #include "led/session/session_state.h"
 #include "led/transport/h264_annex_b.h"
+#include "led/transport/mjpeg_packet.h"
 #include "led/transport/tcp_socket.h"
+#include "led/transport/udp_socket.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -33,6 +42,7 @@
 namespace {
 
 constexpr const char* kLiveCaptureStopEventName = "Local\\LanExtendedDisplayHostStop";
+constexpr std::uint16_t kFrameAckPort = 17692;
 #if defined(_WIN32)
 constexpr const wchar_t* kDriverCreateMonitorEventName = L"Global\\LanExtendedDisplayCreateMonitor";
 #endif
@@ -49,6 +59,205 @@ bool signalDriverCreateMonitor() {
 #else
     return false;
 #endif
+}
+
+struct FrameAckStats {
+    std::uint64_t acks{0};
+    std::uint64_t unknownAcks{0};
+    double averageRttUs{0.0};
+    std::uint64_t maxRttUs{0};
+    std::uint64_t lastFrameId{0};
+};
+
+enum class FrameAckStage {
+    receive,
+    render,
+};
+
+struct ParsedFrameAck {
+    std::uint64_t frameId{0};
+    FrameAckStage stage{FrameAckStage::receive};
+};
+
+struct FrameAckTracker {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> sentFrames;
+    FrameAckStats receiveStats;
+    FrameAckStats renderStats;
+};
+
+std::string parseAckField(const std::string& message, const char* key) {
+    const auto begin = message.find(key);
+    if (begin == std::string::npos) {
+        return {};
+    }
+    const auto valueBegin = begin + std::char_traits<char>::length(key);
+    const auto end = message.find(';', valueBegin);
+    return message.substr(valueBegin, end == std::string::npos ? std::string::npos : end - valueBegin);
+}
+
+std::optional<ParsedFrameAck> parseFrameAck(const std::string& message) {
+    constexpr const char* prefix = "LED_FRAME_ACK_V1";
+    if (message.rfind(prefix, 0) != 0) {
+        return std::nullopt;
+    }
+    const auto frameText = parseAckField(message, "frame=");
+    if (frameText.empty()) {
+        return std::nullopt;
+    }
+    try {
+        ParsedFrameAck ack;
+        ack.frameId = static_cast<std::uint64_t>(std::stoull(frameText));
+        ack.stage = parseAckField(message, "stage=") == "render" ? FrameAckStage::render : FrameAckStage::receive;
+        return ack;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+void noteFrameSent(FrameAckTracker& tracker, std::uint64_t frameId) {
+    if (frameId == 0) {
+        return;
+    }
+    std::scoped_lock lock(tracker.mutex);
+    tracker.sentFrames[frameId] = std::chrono::steady_clock::now();
+    if (tracker.sentFrames.size() > 240) {
+        const auto cutoff = frameId > 240 ? frameId - 240 : 0;
+        for (auto it = tracker.sentFrames.begin(); it != tracker.sentFrames.end();) {
+            if (it->first < cutoff) {
+                it = tracker.sentFrames.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
+void updateAckStats(FrameAckStats& stats, std::uint64_t frameId, std::uint64_t rttUs) {
+    ++stats.acks;
+    stats.lastFrameId = std::max(stats.lastFrameId, frameId);
+    stats.maxRttUs = std::max(stats.maxRttUs, rttUs);
+    if (stats.acks == 1) {
+        stats.averageRttUs = static_cast<double>(rttUs);
+    } else {
+        stats.averageRttUs += (static_cast<double>(rttUs) - stats.averageRttUs) /
+            static_cast<double>(stats.acks);
+    }
+}
+
+void noteFrameAck(FrameAckTracker& tracker, const ParsedFrameAck& ack) {
+    const auto now = std::chrono::steady_clock::now();
+    std::scoped_lock lock(tracker.mutex);
+    auto found = tracker.sentFrames.find(ack.frameId);
+    auto& stats = ack.stage == FrameAckStage::render ? tracker.renderStats : tracker.receiveStats;
+    if (found == tracker.sentFrames.end()) {
+        ++stats.unknownAcks;
+        return;
+    }
+    const auto rttUs = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(now - found->second).count());
+    updateAckStats(stats, ack.frameId, rttUs);
+    if (ack.stage == FrameAckStage::render) {
+        tracker.sentFrames.erase(found);
+    }
+}
+
+std::pair<FrameAckStats, FrameAckStats> snapshotFrameAckStats(FrameAckTracker& tracker) {
+    std::scoped_lock lock(tracker.mutex);
+    return {tracker.receiveStats, tracker.renderStats};
+}
+
+struct DirtyRect {
+    std::uint32_t x{0};
+    std::uint32_t y{0};
+    std::uint32_t width{0};
+    std::uint32_t height{0};
+    bool fullFrame{true};
+    bool empty{false};
+};
+
+DirtyRect fullDirtyRect(std::uint32_t width, std::uint32_t height) {
+    return DirtyRect{0, 0, width, height, true, width == 0 || height == 0};
+}
+
+DirtyRect computeDirtyRect(
+    const led::host::CapturedFrame& current,
+    const led::host::CapturedFrame& previous,
+    std::uint32_t alignPixels,
+    double fullFrameAreaRatio) {
+    if (current.bgra.empty() || current.width == 0 || current.height == 0) {
+        return DirtyRect{0, 0, 0, 0, true, true};
+    }
+    if (previous.bgra.size() != current.bgra.size() ||
+        previous.width != current.width ||
+        previous.height != current.height) {
+        return fullDirtyRect(current.width, current.height);
+    }
+
+    std::uint32_t minX = current.width;
+    std::uint32_t minY = current.height;
+    std::uint32_t maxX = 0;
+    std::uint32_t maxY = 0;
+    bool changed = false;
+    for (std::uint32_t y = 0; y < current.height; ++y) {
+        const auto rowOffset = static_cast<std::size_t>(y) * current.width * 4;
+        for (std::uint32_t x = 0; x < current.width; ++x) {
+            const auto offset = rowOffset + static_cast<std::size_t>(x) * 4;
+            if (current.bgra[offset] != previous.bgra[offset] ||
+                current.bgra[offset + 1] != previous.bgra[offset + 1] ||
+                current.bgra[offset + 2] != previous.bgra[offset + 2]) {
+                minX = std::min(minX, x);
+                minY = std::min(minY, y);
+                maxX = std::max(maxX, x);
+                maxY = std::max(maxY, y);
+                changed = true;
+            }
+        }
+    }
+    if (!changed) {
+        return DirtyRect{0, 0, 0, 0, false, true};
+    }
+
+    const auto align = std::max<std::uint32_t>(1, alignPixels);
+    minX = (minX / align) * align;
+    minY = (minY / align) * align;
+    maxX = std::min<std::uint32_t>(current.width - 1, ((maxX + align) / align) * align + (align - 1));
+    maxY = std::min<std::uint32_t>(current.height - 1, ((maxY + align) / align) * align + (align - 1));
+    const auto width = maxX - minX + 1;
+    const auto height = maxY - minY + 1;
+    const auto area = static_cast<double>(width) * static_cast<double>(height);
+    const auto fullArea = static_cast<double>(current.width) * static_cast<double>(current.height);
+    if (fullArea <= 0.0 || area / fullArea >= fullFrameAreaRatio) {
+        return fullDirtyRect(current.width, current.height);
+    }
+    return DirtyRect{minX, minY, width, height, false, false};
+}
+
+std::thread startFrameAckListener(FrameAckTracker& tracker, std::atomic_bool& stop) {
+    return std::thread([&tracker, &stop]() {
+        led::transport::UdpSocket socket;
+        auto status = socket.bind(kFrameAckPort);
+        if (!status.isOk()) {
+            led::logWarn("frame ack listener disabled: " + status.message());
+            return;
+        }
+        socket.setReceiveTimeoutMs(250);
+        led::logInfo("host frame ack listener bound on UDP port " + std::to_string(kFrameAckPort));
+        while (!stop.load()) {
+            std::vector<std::uint8_t> bytes;
+            led::transport::UdpEndpoint source;
+            status = socket.receiveFrom(512, bytes, source);
+            if (!status.isOk()) {
+                continue;
+            }
+            const std::string message(bytes.begin(), bytes.end());
+            const auto ack = parseFrameAck(message);
+            if (ack.has_value()) {
+                noteFrameAck(tracker, *ack);
+            }
+        }
+        socket.close();
+    });
 }
 
 std::uint16_t parsePort(const char* value, std::uint16_t fallback) {
@@ -615,6 +824,8 @@ int runServeLiveCaptureMode(int argc, char** argv) {
         return 1;
     }
 
+    FrameAckTracker frameAckTracker;
+    auto frameAckThread = startFrameAckListener(frameAckTracker, stopInput);
     const auto frameInterval = std::chrono::microseconds(1000000 / actualFps);
     auto nextFrameTime = std::chrono::steady_clock::now();
     std::uint32_t capturedFrames = 0;
@@ -668,8 +879,12 @@ int runServeLiveCaptureMode(int argc, char** argv) {
         if (encoded.keyFrame) {
             ++keyFrames;
         }
+        const bool hasEncodedData = !encoded.payload.empty() || !encoded.nalUnits.empty();
         bytesSent += encoded.payload.size();
         nalUnitsSent += encoded.nalUnits.size();
+        if (hasEncodedData) {
+            noteFrameSent(frameAckTracker, encoded.frameId);
+        }
         status = sender.sendFrame(encoded);
         if (!status.isOk()) {
             break;
@@ -696,11 +911,20 @@ int runServeLiveCaptureMode(int argc, char** argv) {
             }
         }
         if (now - lastVideoStatsLog >= std::chrono::seconds(1)) {
+            const auto [receiveAckStats, renderAckStats] = snapshotFrameAckStats(frameAckTracker);
             std::cout << "Host video live stats: frames=" << capturedFrames
                       << " nals=" << nalUnitsSent
                       << " keyframes=" << keyFrames
                       << " encoded_kb=" << (bytesSent / 1024)
-                      << " fps_target=" << actualFps << '\n';
+                      << " fps_target=" << actualFps
+                      << " receive_ack_count=" << receiveAckStats.acks
+                      << " receive_ack_avg_ms=" << (receiveAckStats.averageRttUs / 1000.0)
+                      << " receive_ack_max_ms=" << (receiveAckStats.maxRttUs / 1000.0)
+                      << " render_ack_count=" << renderAckStats.acks
+                      << " render_ack_avg_ms=" << (renderAckStats.averageRttUs / 1000.0)
+                      << " render_ack_max_ms=" << (renderAckStats.maxRttUs / 1000.0)
+                      << " render_ack_last_frame=" << renderAckStats.lastFrameId
+                      << " ack_unknown=" << (receiveAckStats.unknownAcks + renderAckStats.unknownAcks) << '\n';
             lastVideoStatsLog = now;
         }
         nextFrameTime += frameInterval;
@@ -711,6 +935,9 @@ int runServeLiveCaptureMode(int argc, char** argv) {
     encoder.stop();
     capture.stop();
     stopInput = true;
+    if (frameAckThread.joinable()) {
+        frameAckThread.join();
+    }
     if (inputThread.joinable()) {
         inputThread.join();
     }
@@ -744,6 +971,255 @@ int runServeLiveCaptureMode(int argc, char** argv) {
         std::cout << "Last input source: " << lastInputSource.address << ':' << lastInputSource.port << '\n';
     }
     printInputReceiverStats(inputStats);
+    return 0;
+}
+
+int runServeMjpegCaptureMode(int argc, char** argv) {
+    LiveCaptureStopEvent stopEvent;
+    const auto controlPort = argc >= 3 ? parsePort(argv[2], 17660) : std::uint16_t{17660};
+    const auto udpPort = argc >= 4 ? parsePort(argv[3], 17670) : std::uint16_t{17670};
+    const auto frameCount = argc >= 5 ? parseU32(argv[4], 0) : std::uint32_t{0};
+    const auto fps = argc >= 6 ? parseU32(argv[5], 60) : std::uint32_t{60};
+    const auto qualityPercent = argc >= 7 ? parseU32(argv[6], 55) : std::uint32_t{55};
+    const auto width = argc >= 8 ? parseU32(argv[7], 1920) : std::uint32_t{1920};
+    const auto height = argc >= 9 ? parseU32(argv[8], 1080) : std::uint32_t{1080};
+    const auto inputPort = argc >= 10 ? parsePort(argv[9], 17691) : std::uint16_t{17691};
+    led::host::InputInjectionBackend backend = led::host::InputInjectionBackend::sendInput;
+    if (argc >= 11 && !led::host::parseInputInjectionBackend(argv[10], backend)) {
+        std::cerr << "Usage: led_host_app --serve-mjpeg-capture [control-port] [udp-port] [frames] [fps] [quality-percent] [width] [height] [input-port] [dry-run|sendinput]\n";
+        return 1;
+    }
+    const auto actualFps = fps == 0 ? std::uint32_t{60} : fps;
+    const auto mode = makeVideoMode(width, height, actualFps, 0);
+
+    led::host::DisplayManager displayManager;
+    signalDriverCreateMonitor();
+    auto status = displayManager.createVirtualDisplay(mode.resolution);
+    if (!status.isOk()) {
+        led::logError(status.message());
+        return 1;
+    }
+
+    led::host::InputReceiver inputReceiver;
+    status = inputReceiver.bind(inputPort);
+    if (!status.isOk()) {
+        displayManager.destroyVirtualDisplay();
+        displayManager.restoreDisplayLayout();
+        led::logError(status.message());
+        return 1;
+    }
+    inputReceiver.setReceiveTimeoutMs(200);
+    led::host::InputInjector injector(displayManager, backend);
+    std::atomic_bool stopInput{false};
+    led::Status inputStatus;
+    std::thread inputThread([&]() {
+        auto lastStatsLog = std::chrono::steady_clock::now();
+        while (!stopInput.load() && !stopEvent.requested()) {
+            led::protocol::InputEvent event;
+            led::transport::UdpEndpoint source;
+            auto receiveStatus = inputReceiver.receive(event, source);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastStatsLog >= std::chrono::seconds(1)) {
+                const auto stats = inputReceiver.stats();
+                if (stats.eventsReceived > 0) {
+                    std::cout << "Host input live stats: events=" << stats.eventsReceived
+                              << " moves=" << stats.pointerMoves
+                              << " buttons=" << stats.pointerButtons
+                              << " keys=" << stats.keyEvents
+                              << " avg_ms=" << (stats.averageLatencyUs / 1000.0)
+                              << " jitter_ms=" << (stats.jitterUs / 1000.0)
+                              << " sequence_gaps=" << stats.sequenceGaps << '\n';
+                }
+                lastStatsLog = now;
+            }
+            if (!receiveStatus.isOk()) {
+                continue;
+            }
+            auto injectStatus = injector.inject(event);
+            if (!injectStatus.isOk()) {
+                inputStatus = injectStatus;
+                stopInput = true;
+                return;
+            }
+        }
+    });
+    auto stopInputThread = [&]() {
+        stopInput = true;
+        if (inputThread.joinable()) {
+            inputThread.join();
+        }
+        inputReceiver.close();
+    };
+
+    led::transport::TcpStream stream;
+    led::protocol::ClientHello hello;
+    led::protocol::ClientReady ready;
+      status = acceptReadyClient(controlPort, udpPort, mode, stream, hello, ready, 10000);
+      if (!status.isOk()) {
+          stopInputThread();
+          displayManager.destroyVirtualDisplay();
+          displayManager.restoreDisplayLayout();
+          led::logError(status.message());
+        return 1;
+    }
+
+    led::host::CaptureEngine capture;
+    const auto& display = displayManager.virtualDisplay();
+      status = capture.startRegion(mode.resolution, display.originX, display.originY, display.deviceName);
+      if (!status.isOk()) {
+          stopInputThread();
+          displayManager.destroyVirtualDisplay();
+          displayManager.restoreDisplayLayout();
+          led::logError(status.message());
+        return 1;
+    }
+
+    led::transport::UdpSocket socket;
+      status = socket.open();
+      if (!status.isOk()) {
+          capture.stop();
+          stopInputThread();
+          displayManager.destroyVirtualDisplay();
+          displayManager.restoreDisplayLayout();
+          led::logError(status.message());
+        return 1;
+    }
+    const auto target = led::transport::UdpEndpoint{stream.peerEndpoint().address, ready.rtpPort};
+
+    std::atomic_bool stopAck{false};
+    FrameAckTracker frameAckTracker;
+    auto frameAckThread = startFrameAckListener(frameAckTracker, stopAck);
+    const auto frameInterval = std::chrono::microseconds(1000000 / actualFps);
+    auto nextFrameTime = std::chrono::steady_clock::now();
+    auto lastVideoStatsLog = nextFrameTime;
+    std::uint32_t capturedFrames = 0;
+    std::uint64_t encodedBytes = 0;
+    std::uint64_t packetsSent = 0;
+    std::uint64_t dirtyFrames = 0;
+    std::uint64_t fullFrames = 0;
+    std::uint64_t skippedFrames = 0;
+    std::uint64_t dirtyAreaPixels = 0;
+    const float quality = std::clamp(static_cast<float>(qualityPercent) / 100.0F, 0.1F, 1.0F);
+    led::host::CapturedFrame previousFrame;
+    const auto keyFrameInterval = std::max<std::uint32_t>(1, actualFps);
+
+    while (!stopEvent.requested() && (frameCount == 0 || capturedFrames < frameCount)) {
+        led::host::CapturedFrame frame;
+        status = capture.captureNextFrame(frame);
+        if (!status.isOk()) {
+            break;
+        }
+
+        const bool forceKeyFrame = previousFrame.bgra.empty() || (capturedFrames % keyFrameInterval) == 0;
+        const auto dirty = forceKeyFrame
+            ? fullDirtyRect(frame.width, frame.height)
+            : computeDirtyRect(frame, previousFrame, 16, 0.70);
+        previousFrame = frame;
+        if (dirty.empty) {
+            ++capturedFrames;
+            ++skippedFrames;
+            nextFrameTime += frameInterval;
+            std::this_thread::sleep_until(nextFrameTime);
+            continue;
+        }
+
+        led::host::EncodedJpegFrame jpeg;
+        status = led::host::encodeBgraJpegRect(frame, dirty.x, dirty.y, dirty.width, dirty.height, quality, jpeg);
+        if (!status.isOk()) {
+            break;
+        }
+        const auto packets = led::transport::packetizeMjpegFrameRect(
+            jpeg.jpegBytes,
+            jpeg.frameId,
+            jpeg.timestampUs,
+            dirty.fullFrame,
+            frame.width,
+            frame.height,
+            dirty.x,
+            dirty.y,
+            dirty.width,
+            dirty.height,
+            1200);
+        if (packets.empty()) {
+            status = led::Status::unavailable("MJPEG packetization produced no packets");
+            break;
+        }
+        noteFrameSent(frameAckTracker, jpeg.frameId);
+        for (const auto& packet : packets) {
+            status = socket.sendTo(packet, target);
+            if (!status.isOk()) {
+                break;
+            }
+            ++packetsSent;
+        }
+        if (!status.isOk()) {
+            break;
+        }
+
+        ++capturedFrames;
+        encodedBytes += jpeg.jpegBytes.size();
+        dirtyAreaPixels += static_cast<std::uint64_t>(dirty.width) * dirty.height;
+        if (dirty.fullFrame) {
+            ++fullFrames;
+        } else {
+            ++dirtyFrames;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastVideoStatsLog >= std::chrono::seconds(1)) {
+            const auto [receiveAckStats, renderAckStats] = snapshotFrameAckStats(frameAckTracker);
+            std::cout << "Host MJPEG live stats: frames=" << capturedFrames
+                      << " packets=" << packetsSent
+                      << " encoded_kb=" << (encodedBytes / 1024)
+                      << " avg_frame_kb=" << (capturedFrames == 0 ? 0 : (encodedBytes / 1024 / capturedFrames))
+                      << " full=" << fullFrames
+                      << " dirty=" << dirtyFrames
+                      << " skipped=" << skippedFrames
+                      << " avg_dirty_pct=" << (capturedFrames == 0 ? 0.0 :
+                          (static_cast<double>(dirtyAreaPixels) * 100.0 /
+                           (static_cast<double>(capturedFrames) * mode.resolution.width * mode.resolution.height)))
+                      << " fps_target=" << actualFps
+                      << " receive_ack_count=" << receiveAckStats.acks
+                      << " receive_ack_avg_ms=" << (receiveAckStats.averageRttUs / 1000.0)
+                      << " receive_ack_max_ms=" << (receiveAckStats.maxRttUs / 1000.0)
+                      << " render_ack_count=" << renderAckStats.acks
+                      << " render_ack_avg_ms=" << (renderAckStats.averageRttUs / 1000.0)
+                      << " render_ack_max_ms=" << (renderAckStats.maxRttUs / 1000.0)
+                      << " render_ack_last_frame=" << renderAckStats.lastFrameId
+                      << " ack_unknown=" << (receiveAckStats.unknownAcks + renderAckStats.unknownAcks) << '\n';
+            lastVideoStatsLog = now;
+        }
+        nextFrameTime += frameInterval;
+        std::this_thread::sleep_until(nextFrameTime);
+    }
+
+    socket.close();
+      capture.stop();
+      stopAck = true;
+      if (frameAckThread.joinable()) {
+          frameAckThread.join();
+      }
+      stopInputThread();
+      displayManager.destroyVirtualDisplay();
+      displayManager.restoreDisplayLayout();
+      if (status.isOk() && !inputStatus.isOk()) {
+          status = inputStatus;
+      }
+    if (!status.isOk()) {
+        led::logError(status.message());
+        return 1;
+    }
+
+    std::cout << "Client ready: " << hello.device.name
+              << " peer=" << target.address << ':' << target.port << '\n';
+    std::cout << "Served MJPEG capture frames=" << capturedFrames
+              << " fps=" << actualFps
+              << " mode=" << mode.resolution.width << 'x' << mode.resolution.height
+              << " quality=" << quality
+              << " full=" << fullFrames
+              << " dirty=" << dirtyFrames
+              << " skipped=" << skippedFrames
+              << " packets=" << packetsSent
+              << " encoded_bytes=" << encodedBytes << '\n';
     return 0;
 }
 
@@ -1115,6 +1591,9 @@ int main(int argc, char** argv) {
     }
     if (argc >= 2 && std::string(argv[1]) == "--serve-live-capture") {
         return runServeLiveCaptureMode(argc, argv);
+    }
+    if (argc >= 2 && std::string(argv[1]) == "--serve-mjpeg-capture") {
+        return runServeMjpegCaptureMode(argc, argv);
     }
     if (argc >= 2 && std::string(argv[1]) == "--send-h264-file") {
         return runSendH264FileMode(argc, argv);

@@ -31,6 +31,11 @@ public:
     Status updateLocalCursor(double normalizedX, double normalizedY);
     Status submitRawFrame(const RawFrameInfo& frame);
     Status submitRawFrameData(const RawFrameInfo& frame, const std::uint8_t* data);
+    Status submitRawFrameRegion(
+        const RawFrameInfo& frame,
+        const std::uint8_t* data,
+        std::uint32_t x,
+        std::uint32_t y);
 
     [[nodiscard]] RendererStats stats() const;
 
@@ -52,7 +57,9 @@ private:
     unsigned int glYTexture_{0};
     unsigned int glUTexture_{0};
     unsigned int glVTexture_{0};
+    unsigned int glUvTexture_{0};
     unsigned int glYuvProgram_{0};
+    unsigned int glNv12Program_{0};
     std::uint32_t glTextureWidth_{0};
     std::uint32_t glTextureHeight_{0};
     std::uint32_t glYuvWidth_{0};

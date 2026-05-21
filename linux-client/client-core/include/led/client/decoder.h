@@ -4,6 +4,8 @@
 #include "led/protocol/messages.h"
 #include "led/client/renderer.h"
 
+#include <deque>
+#include <functional>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -28,12 +30,20 @@ struct DecoderFactoryInfo {
 
 class Decoder {
 public:
+    void setInputPipeline(std::string sourceCaps, std::string parserPipeline);
     void setSinkPipeline(std::string sinkPipeline);
     void setRenderer(Renderer* renderer);
+    void setRenderedFrameCallback(std::function<void(std::uint64_t)> callback);
 
     Status configure(const protocol::VideoMode& mode);
     Status start();
     Status pushNal(const std::vector<std::uint8_t>& nalUnit);
+    Status pushNalWithFrameId(const std::vector<std::uint8_t>& nalUnit, std::uint64_t frameId);
+    Status pushAccessUnit(const std::vector<std::vector<std::uint8_t>>& nalUnits);
+    Status pushAccessUnitWithFrameId(
+        const std::vector<std::vector<std::uint8_t>>& nalUnits,
+        std::uint64_t frameId);
+    Status pushEncodedBufferWithFrameId(const std::vector<std::uint8_t>& bytes, std::uint64_t frameId);
     void drainForMs(unsigned int milliseconds);
     Status stop();
 
@@ -47,12 +57,23 @@ public:
 private:
     Status startBackend();
     Status pushNalToBackend(const std::vector<std::uint8_t>& nalUnit);
+    Status pushEncodedBufferToBackend(const std::vector<std::uint8_t>& bytes, std::uint64_t frameId);
+    Status pushAccessUnitToBackend(
+        const std::vector<std::vector<std::uint8_t>>& nalUnits,
+        std::uint64_t frameId);
     void stopBackend();
+    void rememberFrameId(std::uint64_t frameId);
+    [[nodiscard]] std::uint64_t takeDecodedFrameId(std::uint64_t ptsNs);
 
     protocol::VideoMode mode_{protocol::defaultStandardMode()};
+    std::string sourceCaps_{"video/x-h264,stream-format=byte-stream,alignment=nal"};
+    std::string parserPipeline_{"h264parse name=parser config-interval=-1 disable-passthrough=true"};
     std::string sinkPipeline_{"fakesink sync=false"};
     DecoderStats stats_{};
     mutable std::mutex mutex_;
+    std::deque<std::uint64_t> pendingFrameIds_;
+    std::uint64_t lastQueuedFrameId_{0};
+    std::function<void(std::uint64_t)> renderedFrameCallback_;
     Renderer* renderer_{nullptr};
     bool running_{false};
 

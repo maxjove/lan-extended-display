@@ -4,6 +4,7 @@ add_library(led_common
     src/h264_rtp_depacketizer.cpp
     src/h264_rtp_packetizer.cpp
     src/logger.cpp
+    src/mjpeg_packet.cpp
     src/messages.cpp
     src/rtp_codec.cpp
     src/session_state.cpp

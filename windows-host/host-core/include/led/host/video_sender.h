@@ -16,7 +16,11 @@ public:
     explicit VideoSender(std::uint32_t ssrc = 0x4C454431);
 
     Status open(const transport::UdpEndpoint& endpoint);
-    Status sendNal(const std::vector<std::uint8_t>& nalUnit, std::uint32_t rtpTimestamp);
+    Status sendNal(
+        const std::vector<std::uint8_t>& nalUnit,
+        std::uint32_t rtpTimestamp,
+        std::uint64_t frameId = 0,
+        bool markerOnLastPacket = true);
     Status sendFrame(const EncodedFrame& frame);
     Status close();
 

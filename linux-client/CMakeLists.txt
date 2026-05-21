@@ -64,3 +64,10 @@ add_executable(led_client_app
     client-ui/client_app.cpp)
 
 target_link_libraries(led_client_app PRIVATE led_client_core Threads::Threads)
+
+find_package(JPEG QUIET)
+if(JPEG_FOUND)
+    target_compile_definitions(led_client_app PRIVATE LED_HAS_LIBJPEG=1)
+    target_include_directories(led_client_app PRIVATE ${JPEG_INCLUDE_DIRS})
+    target_link_libraries(led_client_app PRIVATE ${JPEG_LIBRARIES})
+endif()

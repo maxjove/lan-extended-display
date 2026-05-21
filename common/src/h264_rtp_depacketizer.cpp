@@ -1,5 +1,7 @@
 #include "led/transport/h264_rtp_depacketizer.h"
 
+#include "led/transport/rtp_codec.h"
+
 namespace led::transport {
 
 namespace {
@@ -43,6 +45,8 @@ void H264RtpDepacketizer::reset() {
     assemblingFuA_ = false;
     currentTimestamp_ = 0;
     expectedSequence_ = 0;
+    currentFrameId_ = 0;
+    currentHasFrameId_ = false;
     currentNal_.clear();
 }
 
@@ -50,6 +54,8 @@ Status H264RtpDepacketizer::pushSingleNal(const RtpPacket& packet, ReassembledNa
     reset();
     nal.timestamp = packet.timestamp;
     nal.lastSequenceNumber = packet.sequenceNumber;
+    nal.endOfFrame = packet.marker;
+    nal.hasFrameId = parseFrameIdExtension(packet, nal.frameId);
     nal.nalUnit = packet.payload;
     return Status::ok();
 }
@@ -75,6 +81,7 @@ Status H264RtpDepacketizer::pushFuA(const RtpPacket& packet, ReassembledNal& nal
         assemblingFuA_ = true;
         currentTimestamp_ = packet.timestamp;
         expectedSequence_ = nextSequence(packet.sequenceNumber);
+        currentHasFrameId_ = parseFrameIdExtension(packet, currentFrameId_);
     } else {
         if (!assemblingFuA_) {
             return Status::invalidState("received FU-A continuation before start");
@@ -98,6 +105,9 @@ Status H264RtpDepacketizer::pushFuA(const RtpPacket& packet, ReassembledNal& nal
 
     nal.timestamp = packet.timestamp;
     nal.lastSequenceNumber = packet.sequenceNumber;
+    nal.endOfFrame = packet.marker;
+    nal.frameId = currentFrameId_;
+    nal.hasFrameId = currentHasFrameId_;
     nal.nalUnit = currentNal_;
     reset();
     return Status::ok();

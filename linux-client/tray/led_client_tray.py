@@ -49,11 +49,12 @@ def parse_fields(message):
 
 
 class ClientController:
-    def __init__(self, client_bin, sink, drain_ms, input_mode):
+    def __init__(self, client_bin, sink, drain_ms, input_mode, video_mode):
         self.client_bin = os.path.expanduser(client_bin)
         self.sink = sink
         self.drain_ms = str(drain_ms)
         self.input_mode = input_mode
+        self.video_mode = video_mode
         self.process = None
         self.lock = threading.Lock()
         self.last_host = ""
@@ -73,17 +74,29 @@ class ClientController:
             if self.process is not None and self.process.poll() is None and self.last_host == host:
                 return
             self.stop_locked()
-            command = [
-                self.client_bin,
-                "--receive-test-stream",
-                host,
-                str(control_port),
-                "0",
-                self.sink,
-                self.drain_ms,
-                self.input_mode,
-                str(input_port),
-            ]
+            if self.video_mode == "mjpeg":
+                command = [
+                    self.client_bin,
+                    "--receive-mjpeg-stream",
+                    host,
+                    str(control_port),
+                    "0",
+                    self.drain_ms,
+                    self.input_mode,
+                    str(input_port),
+                ]
+            else:
+                command = [
+                    self.client_bin,
+                    "--receive-test-stream",
+                    host,
+                    str(control_port),
+                    "0",
+                    self.sink,
+                    self.drain_ms,
+                    self.input_mode,
+                    str(input_port),
+                ]
             env = os.environ.copy()
             env.setdefault("DISPLAY", ":0")
             env.setdefault("XAUTHORITY", os.path.expanduser("~/.Xauthority"))
@@ -236,9 +249,10 @@ def main():
     parser.add_argument("--sink", default="avdec-i420gl")
     parser.add_argument("--drain-ms", default=1000, type=int)
     parser.add_argument("--input-mode", default="x11-input")
+    parser.add_argument("--video-mode", choices=("mjpeg", "h264"), default="mjpeg")
     args = parser.parse_args()
 
-    controller = ClientController(args.client_bin, args.sink, args.drain_ms, args.input_mode)
+    controller = ClientController(args.client_bin, args.sink, args.drain_ms, args.input_mode, args.video_mode)
     discovery = DiscoveryService(controller)
 
     def handle_signal(_signum, _frame):

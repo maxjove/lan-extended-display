@@ -16,10 +16,11 @@ Run:
 
 The tray icon menu provides:
 
-- `Start default`: starts `led_host_app.exe --serve-live-capture 17660 17670 17691 0 60 sendinput 20000 1920 1080`
+- `Start default`: starts `led_host_app.exe --serve-mjpeg-capture 17660 17670 0 60 55 1920 1080 17691 sendinput` by default
 - `Start discovered client`: starts a Linux client discovered on the LAN through UDP port `17659`
 - `Start by IP...`: sends a connect command to a manually entered Linux client IP, then starts the extended display
 - `Refresh clients`: broadcasts a discovery probe on UDP port `17659`
+- `Quality`: selects MJPEG quality: `Fast 45`, `Balanced 55`, or `Sharp 65`. The value is saved in `led_host_tray.ini`; if a display session is running, the tray restarts that session automatically so the new quality takes effect.
 - `Stop extended display`: asks the running host to stop through `Local\LanExtendedDisplayHostStop`, then removes the IddCx root display device so it disappears from Windows display settings
 - `Install firewall rules`: asks for administrator permission and opens inbound TCP `17660` plus UDP `17659`, `17670`, and `17691` on private/domain networks
 - `Open log`: opens `led_host_tray.log`
@@ -34,7 +35,13 @@ Linux clients advertise themselves with UDP `LED_CLIENT_V1` beacons on port `176
 Windows sends `LED_DISCOVER_V1` probes and can send `LED_CONNECT_V1` to ask a selected Linux client to connect back to the Windows host.
 If discovered clients do not appear, run `Install firewall rules` from the Windows tray menu once.
 
-The video/control path is unchanged: Windows still listens on TCP `17660`, sends RTP video on UDP `17670`, and receives input on UDP `17691`.
+The video/control path is unchanged: Windows listens on TCP `17660`, sends low-latency MJPEG video on UDP `17670`, and receives input on UDP `17691`.
+Frame latency telemetry uses UDP `17692`. The host logs `receive_ack_*` and `render_ack_*`:
+
+- `receive_ack_*`: Windows frame send to Linux RTP receive/decode-queue acknowledgement RTT
+- `render_ack_*`: Windows frame send to Linux decoded-frame renderer submission RTT
+
+Both are clock-safe because they use the Windows send timestamp and Windows receive timestamp around a Linux ACK.
 
 The virtual display is session-scoped: it should not be present before `Start extended display`.
 If no Linux client connects within 10 seconds, or if the host exits unexpectedly, the tray app removes the virtual display automatically.

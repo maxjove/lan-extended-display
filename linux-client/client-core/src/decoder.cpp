@@ -18,6 +18,8 @@ namespace led::client {
 #if defined(LED_HAS_GSTREAMER)
 namespace {
 
+constexpr std::uint64_t kFrameIdPtsUnitNs = 1000000;
+
 RawFrameInfo rawFrameInfoFromSample(GstBuffer* buffer, GstPad* pad) {
     RawFrameInfo info;
     if (buffer != nullptr) {
@@ -76,8 +78,20 @@ void Decoder::setSinkPipeline(std::string sinkPipeline) {
     }
 }
 
+void Decoder::setInputPipeline(std::string sourceCaps, std::string parserPipeline) {
+    if (!sourceCaps.empty()) {
+        sourceCaps_ = std::move(sourceCaps);
+    }
+    parserPipeline_ = std::move(parserPipeline);
+}
+
 void Decoder::setRenderer(Renderer* renderer) {
     renderer_ = renderer;
+}
+
+void Decoder::setRenderedFrameCallback(std::function<void(std::uint64_t)> callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    renderedFrameCallback_ = std::move(callback);
 }
 
 Status Decoder::configure(const protocol::VideoMode& mode) {
@@ -94,6 +108,8 @@ Status Decoder::start() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stats_ = {};
+        pendingFrameIds_.clear();
+        lastQueuedFrameId_ = 0;
     }
     auto status = startBackend();
     if (!status.isOk()) {
@@ -123,6 +139,114 @@ Status Decoder::pushNal(const std::vector<std::uint8_t>& nalUnit) {
     }
 
     auto status = pushNalToBackend(nalUnit);
+    if (!status.isOk()) {
+        return status;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.backendAccepted;
+    }
+    return Status::ok();
+}
+
+Status Decoder::pushNalWithFrameId(const std::vector<std::uint8_t>& nalUnit, std::uint64_t frameId) {
+    rememberFrameId(frameId);
+    return pushNal(nalUnit);
+}
+
+Status Decoder::pushAccessUnit(const std::vector<std::vector<std::uint8_t>>& nalUnits) {
+    if (!running_) {
+        return Status::invalidState("cannot push access unit while decoder is stopped");
+    }
+    if (nalUnits.empty()) {
+        return Status::invalidArgument("cannot push empty H.264 access unit");
+    }
+
+    std::uint64_t bytes = 0;
+    std::uint64_t keyFrames = 0;
+    for (const auto& nalUnit : nalUnits) {
+        if (nalUnit.empty()) {
+            return Status::invalidArgument("cannot push H.264 access unit with an empty NAL");
+        }
+        bytes += nalUnit.size();
+        if ((nalUnit.front() & 0x1F) == 5) {
+            ++keyFrames;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.nalUnits += nalUnits.size();
+        stats_.bytes += bytes;
+        stats_.keyFrames += keyFrames;
+    }
+
+    auto status = pushAccessUnitToBackend(nalUnits, 0);
+    if (!status.isOk()) {
+        return status;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.backendAccepted += nalUnits.size();
+    }
+    return Status::ok();
+}
+
+Status Decoder::pushAccessUnitWithFrameId(
+    const std::vector<std::vector<std::uint8_t>>& nalUnits,
+    std::uint64_t frameId) {
+    rememberFrameId(frameId);
+    if (!running_) {
+        return Status::invalidState("cannot push access unit while decoder is stopped");
+    }
+    if (nalUnits.empty()) {
+        return Status::invalidArgument("cannot push empty H.264 access unit");
+    }
+
+    std::uint64_t bytes = 0;
+    std::uint64_t keyFrames = 0;
+    for (const auto& nalUnit : nalUnits) {
+        if (nalUnit.empty()) {
+            return Status::invalidArgument("cannot push H.264 access unit with an empty NAL");
+        }
+        bytes += nalUnit.size();
+        if ((nalUnit.front() & 0x1F) == 5) {
+            ++keyFrames;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.nalUnits += nalUnits.size();
+        stats_.bytes += bytes;
+        stats_.keyFrames += keyFrames;
+    }
+
+    auto status = pushAccessUnitToBackend(nalUnits, frameId);
+    if (!status.isOk()) {
+        return status;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.backendAccepted += nalUnits.size();
+    }
+    return Status::ok();
+}
+
+Status Decoder::pushEncodedBufferWithFrameId(const std::vector<std::uint8_t>& bytes, std::uint64_t frameId) {
+    rememberFrameId(frameId);
+    if (!running_) {
+        return Status::invalidState("cannot push encoded buffer while decoder is stopped");
+    }
+    if (bytes.empty()) {
+        return Status::invalidArgument("cannot push empty encoded buffer");
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.nalUnits;
+        stats_.bytes += bytes.size();
+    }
+    auto status = pushEncodedBufferToBackend(bytes, frameId);
     if (!status.isOk()) {
         return status;
     }
@@ -169,9 +293,12 @@ void Decoder::noteDecodedFrame(const RawFrameInfo& frame) {
 }
 
 void Decoder::noteDecodedFrameData(const RawFrameInfo& frame, const std::uint8_t* data) {
+    const auto frameId = takeDecodedFrameId(frame.ptsNs);
+    std::function<void(std::uint64_t)> callback;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         ++stats_.decodedFrames;
+        callback = renderedFrameCallback_;
     }
     if (renderer_ != nullptr) {
         if (data != nullptr) {
@@ -180,6 +307,43 @@ void Decoder::noteDecodedFrameData(const RawFrameInfo& frame, const std::uint8_t
             renderer_->submitRawFrame(frame);
         }
     }
+    if (callback && frameId != 0) {
+        callback(frameId);
+    }
+}
+
+void Decoder::rememberFrameId(std::uint64_t frameId) {
+    if (frameId == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (lastQueuedFrameId_ == frameId) {
+        return;
+    }
+    pendingFrameIds_.push_back(frameId);
+    lastQueuedFrameId_ = frameId;
+    while (pendingFrameIds_.size() > 240) {
+        pendingFrameIds_.pop_front();
+    }
+}
+
+std::uint64_t Decoder::takeDecodedFrameId(std::uint64_t ptsNs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (ptsNs != 0 && (ptsNs % kFrameIdPtsUnitNs) == 0) {
+        const auto frameId = ptsNs / kFrameIdPtsUnitNs;
+        if (frameId != 0 && frameId <= lastQueuedFrameId_) {
+            while (!pendingFrameIds_.empty() && pendingFrameIds_.front() <= frameId) {
+                pendingFrameIds_.pop_front();
+            }
+            return frameId;
+        }
+    }
+    if (pendingFrameIds_.empty()) {
+        return 0;
+    }
+    const auto frameId = pendingFrameIds_.front();
+    pendingFrameIds_.pop_front();
+    return frameId;
 }
 
 std::vector<DecoderFactoryInfo> Decoder::availableGstreamerFactories() {
@@ -234,9 +398,9 @@ Status Decoder::startBackend() {
 
     const std::string pipelineDescription =
         "appsrc name=src is-live=true format=time do-timestamp=true "
-        "caps=video/x-h264,stream-format=byte-stream,alignment=nal "
-        "! h264parse "
-        "! " + sinkPipeline_;
+        "caps=" + sourceCaps_ +
+        (parserPipeline_.empty() ? " ! " : " ! " + parserPipeline_ + " ! ") +
+        sinkPipeline_;
 
     GError* error = nullptr;
     auto* pipeline = gst_parse_launch(pipelineDescription.c_str(), &error);
@@ -284,12 +448,23 @@ Status Decoder::startBackend() {
 }
 
 Status Decoder::pushNalToBackend(const std::vector<std::uint8_t>& nalUnit) {
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(nalUnit.size() + 4);
+    bytes.push_back(0x00);
+    bytes.push_back(0x00);
+    bytes.push_back(0x00);
+    bytes.push_back(0x01);
+    bytes.insert(bytes.end(), nalUnit.begin(), nalUnit.end());
+    return pushEncodedBufferToBackend(bytes, 0);
+}
+
+Status Decoder::pushEncodedBufferToBackend(const std::vector<std::uint8_t>& bytes, std::uint64_t frameId) {
 #if defined(LED_HAS_GSTREAMER)
     if (appsrc_ == nullptr) {
         return Status::invalidState("GStreamer appsrc is not started");
     }
 
-    auto* buffer = gst_buffer_new_allocate(nullptr, nalUnit.size() + 4, nullptr);
+    auto* buffer = gst_buffer_new_allocate(nullptr, bytes.size(), nullptr);
     if (buffer == nullptr) {
         return Status::internalError("failed to allocate GStreamer buffer");
     }
@@ -300,12 +475,13 @@ Status Decoder::pushNalToBackend(const std::vector<std::uint8_t>& nalUnit) {
         return Status::internalError("failed to map GStreamer buffer");
     }
 
-    map.data[0] = 0x00;
-    map.data[1] = 0x00;
-    map.data[2] = 0x00;
-    map.data[3] = 0x01;
-    std::copy(nalUnit.begin(), nalUnit.end(), map.data + 4);
+    std::copy(bytes.begin(), bytes.end(), map.data);
     gst_buffer_unmap(buffer, &map);
+    if (frameId != 0) {
+        GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(frameId * kFrameIdPtsUnitNs);
+        GST_BUFFER_DTS(buffer) = GST_BUFFER_PTS(buffer);
+        GST_BUFFER_DURATION(buffer) = static_cast<GstClockTime>(kFrameIdPtsUnitNs);
+    }
 
     GstFlowReturn result = GST_FLOW_ERROR;
     g_signal_emit_by_name(G_OBJECT(appsrc_), "push-buffer", buffer, &result);
@@ -314,7 +490,60 @@ Status Decoder::pushNalToBackend(const std::vector<std::uint8_t>& nalUnit) {
         return Status::internalError("GStreamer appsrc rejected buffer");
     }
 #else
-    (void)nalUnit;
+    (void)bytes;
+    (void)frameId;
+#endif
+    return Status::ok();
+}
+
+Status Decoder::pushAccessUnitToBackend(
+    const std::vector<std::vector<std::uint8_t>>& nalUnits,
+    std::uint64_t frameId) {
+#if defined(LED_HAS_GSTREAMER)
+    if (appsrc_ == nullptr) {
+        return Status::invalidState("GStreamer appsrc is not started");
+    }
+
+    std::size_t totalBytes = 0;
+    for (const auto& nalUnit : nalUnits) {
+        totalBytes += nalUnit.size() + 4;
+    }
+    auto* buffer = gst_buffer_new_allocate(nullptr, totalBytes, nullptr);
+    if (buffer == nullptr) {
+        return Status::internalError("failed to allocate GStreamer access-unit buffer");
+    }
+
+    GstMapInfo map{};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
+        gst_buffer_unref(buffer);
+        return Status::internalError("failed to map GStreamer access-unit buffer");
+    }
+
+    std::size_t offset = 0;
+    for (const auto& nalUnit : nalUnits) {
+        map.data[offset++] = 0x00;
+        map.data[offset++] = 0x00;
+        map.data[offset++] = 0x00;
+        map.data[offset++] = 0x01;
+        std::copy(nalUnit.begin(), nalUnit.end(), map.data + offset);
+        offset += nalUnit.size();
+    }
+    gst_buffer_unmap(buffer, &map);
+    if (frameId != 0) {
+        GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(frameId * kFrameIdPtsUnitNs);
+        GST_BUFFER_DTS(buffer) = GST_BUFFER_PTS(buffer);
+        GST_BUFFER_DURATION(buffer) = static_cast<GstClockTime>(kFrameIdPtsUnitNs);
+    }
+
+    GstFlowReturn result = GST_FLOW_ERROR;
+    g_signal_emit_by_name(G_OBJECT(appsrc_), "push-buffer", buffer, &result);
+    gst_buffer_unref(buffer);
+    if (result != GST_FLOW_OK) {
+        return Status::internalError("GStreamer appsrc rejected access-unit buffer");
+    }
+#else
+    (void)nalUnits;
+    (void)frameId;
 #endif
     return Status::ok();
 }
