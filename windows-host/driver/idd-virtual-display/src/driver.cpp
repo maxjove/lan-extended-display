@@ -394,7 +394,6 @@ NTSTATUS DestroyVirtualMonitor() {
         LeaveCriticalSection(&g_stateLock);
         return STATUS_SUCCESS;
     }
-    g_state.monitor = nullptr;
     LeaveCriticalSection(&g_stateLock);
 
     StopSwapChainPump(&g_state.pump);
@@ -403,6 +402,12 @@ NTSTATUS DestroyVirtualMonitor() {
         DebugLogStatus(L"IddCxMonitorDeparture failed", status);
         return status;
     }
+
+    EnterCriticalSection(&g_stateLock);
+    if (g_state.monitor == monitor) {
+        g_state.monitor = nullptr;
+    }
+    LeaveCriticalSection(&g_stateLock);
 
     DebugLog(L"Virtual monitor departed");
     return STATUS_SUCCESS;
@@ -424,7 +429,15 @@ NTSTATUS RetryCreateVirtualMonitor() {
 }
 
 NTSTATUS RequestDestroyVirtualMonitor() {
-    return DestroyVirtualMonitor();
+    NTSTATUS status = STATUS_SUCCESS;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        status = DestroyVirtualMonitor();
+        if (NT_SUCCESS(status)) {
+            return status;
+        }
+        Sleep(100);
+    }
+    return status;
 }
 
 bool ActiveMonitorRequested() {

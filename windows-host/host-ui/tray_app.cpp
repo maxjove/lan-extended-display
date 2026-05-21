@@ -561,6 +561,17 @@ bool installVirtualDisplay(HWND window) {
     return runElevatedPowerShellScript(window, driverScriptPath(L"install-driver.ps1"));
 }
 
+bool removeVirtualDisplayDevice(HWND window) {
+    logTray(L"remove virtual display device requested");
+    const bool ok = runElevatedPowerShellScript(window, driverScriptPath(L"remove-virtual-display.ps1"));
+    if (g_activeMonitorEvent != nullptr) {
+        CloseHandle(g_activeMonitorEvent);
+        g_activeMonitorEvent = nullptr;
+    }
+    logTray(L"remove virtual display device: %ls", ok ? L"ok" : L"failed");
+    return ok;
+}
+
 bool installFirewallRules(HWND window) {
     const std::wstring script =
         L"$ErrorActionPreference='Stop';"
@@ -721,11 +732,14 @@ void requestDriverMonitorDestroy() {
     signalDriverEvent(kDriverDestroyMonitorEventName);
 }
 
-void removeVirtualDisplayIfInstalled(HWND window) {
+void removeVirtualDisplayIfInstalled(HWND window, bool removeDevice = true) {
     if (!g_virtualDisplayInstalled) {
         return;
     }
     destroyVirtualMonitor(window);
+    if (removeDevice) {
+        removeVirtualDisplayDevice(window);
+    }
     g_virtualDisplayInstalled = false;
 }
 
