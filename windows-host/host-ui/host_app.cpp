@@ -45,11 +45,12 @@ constexpr const char* kLiveCaptureStopEventName = "Local\\LanExtendedDisplayHost
 constexpr std::uint16_t kFrameAckPort = 17692;
 #if defined(_WIN32)
 constexpr const wchar_t* kDriverCreateMonitorEventName = L"Global\\LanExtendedDisplayCreateMonitor";
+constexpr const wchar_t* kDriverDestroyMonitorEventName = L"Global\\LanExtendedDisplayDestroyMonitor";
 #endif
 
-bool signalDriverCreateMonitor() {
+bool signalDriverEvent(const wchar_t* eventName) {
 #if defined(_WIN32)
-    HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, kDriverCreateMonitorEventName);
+    HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName);
     if (event == nullptr) {
         return false;
     }
@@ -60,6 +61,49 @@ bool signalDriverCreateMonitor() {
     return false;
 #endif
 }
+
+bool signalDriverCreateMonitor() {
+#if defined(_WIN32)
+    return signalDriverEvent(kDriverCreateMonitorEventName);
+#else
+    return false;
+#endif
+}
+
+bool signalDriverDestroyMonitor() {
+#if defined(_WIN32)
+    return signalDriverEvent(kDriverDestroyMonitorEventName);
+#else
+    return false;
+#endif
+}
+
+class DriverMonitorLease {
+public:
+    DriverMonitorLease() = default;
+    DriverMonitorLease(const DriverMonitorLease&) = delete;
+    DriverMonitorLease& operator=(const DriverMonitorLease&) = delete;
+    ~DriverMonitorLease() {
+        if (armed_) {
+            signalDriverDestroyMonitor();
+        }
+    }
+
+    void requestCreate() {
+        signalDriverCreateMonitor();
+        armed_ = true;
+    }
+
+    void release() {
+        if (armed_) {
+            signalDriverDestroyMonitor();
+            armed_ = false;
+        }
+    }
+
+private:
+    bool armed_{false};
+};
 
 struct FrameAckStats {
     std::uint64_t acks{0};
@@ -693,8 +737,9 @@ int runServeLiveCaptureMode(int argc, char** argv) {
     const auto actualFps = fps == 0 ? std::uint32_t{30} : fps;
     const auto mode = makeVideoMode(width, height, actualFps, bitrateKbps);
 
+    DriverMonitorLease driverMonitor;
     led::host::DisplayManager displayManager;
-    signalDriverCreateMonitor();
+    driverMonitor.requestCreate();
     auto status = displayManager.createVirtualDisplay(mode.resolution);
     if (!status.isOk()) {
         led::logError(status.message());
@@ -945,6 +990,7 @@ int runServeLiveCaptureMode(int argc, char** argv) {
     inputReceiver.close();
     displayManager.destroyVirtualDisplay();
     displayManager.restoreDisplayLayout();
+    driverMonitor.release();
 
     if (!status.isOk()) {
         led::logError(status.message());
@@ -992,8 +1038,9 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     const auto actualFps = fps == 0 ? std::uint32_t{60} : fps;
     const auto mode = makeVideoMode(width, height, actualFps, 0);
 
+    DriverMonitorLease driverMonitor;
     led::host::DisplayManager displayManager;
-    signalDriverCreateMonitor();
+    driverMonitor.requestCreate();
     auto status = displayManager.createVirtualDisplay(mode.resolution);
     if (!status.isOk()) {
         led::logError(status.message());
@@ -1201,6 +1248,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
       stopInputThread();
       displayManager.destroyVirtualDisplay();
       displayManager.restoreDisplayLayout();
+      driverMonitor.release();
       if (status.isOk() && !inputStatus.isOk()) {
           status = inputStatus;
       }

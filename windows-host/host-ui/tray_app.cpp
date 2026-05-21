@@ -711,6 +711,15 @@ bool destroyVirtualMonitor(HWND window) {
     return ok;
 }
 
+void requestDriverMonitorDestroy() {
+    logTray(L"request driver monitor destroy");
+    if (ensureActiveMonitorEvent()) {
+        ResetEvent(g_activeMonitorEvent);
+        logTray(L"active monitor event reset");
+    }
+    signalDriverEvent(kDriverDestroyMonitorEventName);
+}
+
 void removeVirtualDisplayIfInstalled(HWND window) {
     if (!g_virtualDisplayInstalled) {
         return;
@@ -1108,11 +1117,21 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         addTrayIcon(window);
         startDiscovery();
         SetTimer(window, kMonitorTimerId, 2000, nullptr);
+        requestDriverMonitorDestroy();
         return 0;
     case WM_TIMER:
         if (wParam == kMonitorTimerId && g_virtualDisplayInstalled && !hostStillRunning()) {
             showBalloon(window, L"Extended display ended", L"Host stopped unexpectedly. Removing the virtual display.");
             removeVirtualDisplayIfInstalled(window);
+            return 0;
+        }
+        if (wParam == kMonitorTimerId && !g_virtualDisplayInstalled && !hostStillRunning()) {
+            static ULONGLONG lastOrphanCleanupTick = 0;
+            const ULONGLONG now = GetTickCount64();
+            if (lastOrphanCleanupTick == 0 || now - lastOrphanCleanupTick >= 15000) {
+                requestDriverMonitorDestroy();
+                lastOrphanCleanupTick = now;
+            }
             return 0;
         }
         break;
@@ -1128,6 +1147,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (g_virtualDisplayInstalled) {
             showBalloon(window, L"Extended display ended", L"Host stopped. Removing the virtual display.");
             removeVirtualDisplayIfInstalled(window);
+        } else {
+            requestDriverMonitorDestroy();
         }
         return 0;
     case WM_COMMAND:
