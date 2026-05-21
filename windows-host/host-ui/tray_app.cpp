@@ -58,6 +58,7 @@ HANDLE g_hostStdout{nullptr};
 HANDLE g_hostStderr{nullptr};
 HANDLE g_activeMonitorEvent{nullptr};
 bool g_virtualDisplayInstalled{false};
+bool g_sessionRestarting{false};
 std::atomic_bool g_discoveryStop{false};
 std::thread g_discoveryThread;
 std::mutex g_devicesMutex;
@@ -769,7 +770,7 @@ bool startHost(HWND window) {
         quote(hostExe) +
         L" --serve-mjpeg-capture 17660 17670 0 60 " +
         std::to_wstring(normalizeJpegQuality(g_jpegQuality)) +
-        L" 1920 1080 17691 sendinput";
+        L" 1920 1080 17691 sendinput keep-monitor-on-exit";
 
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
@@ -915,10 +916,21 @@ void setJpegQuality(HWND window, int quality) {
     }
 
     const std::string targetIp = g_selectedClientIp;
-    showBalloon(window, L"Applying quality", L"Restarting the current display session with the new quality.");
-    stopExtendedDisplay(window);
-    Sleep(500);
-    startExtendedDisplay(window, targetIp);
+    showBalloon(window, L"Applying quality", L"Restarting capture without removing the virtual display.");
+    logTray(L"quality restart begin target=%ls", utf8ToWide(targetIp).c_str());
+    g_sessionRestarting = true;
+    ++g_hostGeneration;
+    stopHost();
+    Sleep(150);
+    const bool restarted = startHost(window);
+    g_sessionRestarting = false;
+    if (!restarted) {
+        logTray(L"quality restart failed");
+        showBalloon(window, L"Quality apply failed", L"Capture did not restart. Use Stop to remove the virtual display if needed.");
+        return;
+    }
+    notifyClientToConnect(targetIp);
+    logTray(L"quality restart completed");
 }
 
 void addTrayIcon(HWND window) {
@@ -1121,7 +1133,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         requestDriverMonitorDestroy();
         return 0;
     case WM_TIMER:
-        if (wParam == kMonitorTimerId && g_virtualDisplayInstalled && !hostStillRunning()) {
+        if (wParam == kMonitorTimerId && g_virtualDisplayInstalled && !g_sessionRestarting && !hostStillRunning()) {
             showBalloon(window, L"Extended display ended", L"Host stopped unexpectedly. Removing the virtual display.");
             removeVirtualDisplayIfInstalled(window);
             return 0;

@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <iostream>
 #include <mutex>
@@ -47,6 +48,18 @@ constexpr std::uint16_t kFrameAckPort = 17692;
 constexpr const wchar_t* kDriverCreateMonitorEventName = L"Global\\LanExtendedDisplayCreateMonitor";
 constexpr const wchar_t* kDriverDestroyMonitorEventName = L"Global\\LanExtendedDisplayDestroyMonitor";
 #endif
+
+bool hostDiagnosticsEnabled() {
+    const char* value = std::getenv("LED_HOST_DIAGNOSTICS");
+    if (value == nullptr) {
+        value = std::getenv("LED_ENABLE_STATS");
+    }
+    if (value == nullptr) {
+        return false;
+    }
+    const std::string flag = value;
+    return flag == "1" || flag == "true" || flag == "TRUE" || flag == "on" || flag == "ON";
+}
 
 bool signalDriverEvent(const wchar_t* eventName) {
 #if defined(_WIN32)
@@ -101,6 +114,10 @@ public:
         }
     }
 
+    void disarm() {
+        armed_ = false;
+    }
+
 private:
     bool armed_{false};
 };
@@ -128,6 +145,8 @@ struct FrameAckTracker {
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> sentFrames;
     FrameAckStats receiveStats;
     FrameAckStats renderStats;
+    std::chrono::steady_clock::time_point lastReceiveAck{};
+    std::chrono::steady_clock::time_point lastRenderAck{};
 };
 
 std::string parseAckField(const std::string& message, const char* key) {
@@ -202,6 +221,11 @@ void noteFrameAck(FrameAckTracker& tracker, const ParsedFrameAck& ack) {
         std::chrono::duration_cast<std::chrono::microseconds>(now - found->second).count());
     updateAckStats(stats, ack.frameId, rttUs);
     if (ack.stage == FrameAckStage::render) {
+        tracker.lastRenderAck = now;
+    } else {
+        tracker.lastReceiveAck = now;
+    }
+    if (ack.stage == FrameAckStage::render) {
         tracker.sentFrames.erase(found);
     }
 }
@@ -209,6 +233,18 @@ void noteFrameAck(FrameAckTracker& tracker, const ParsedFrameAck& ack) {
 std::pair<FrameAckStats, FrameAckStats> snapshotFrameAckStats(FrameAckTracker& tracker) {
     std::scoped_lock lock(tracker.mutex);
     return {tracker.receiveStats, tracker.renderStats};
+}
+
+bool renderAckTimedOut(
+    FrameAckTracker& tracker,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::steady_clock::time_point sessionStart,
+    std::chrono::seconds timeout) {
+    std::scoped_lock lock(tracker.mutex);
+    if (tracker.renderStats.acks == 0) {
+        return now - sessionStart > timeout;
+    }
+    return now - tracker.lastRenderAck > timeout;
 }
 
 struct DirtyRect {
@@ -759,6 +795,7 @@ int runServeLiveCaptureMode(int argc, char** argv) {
     std::atomic_bool stopInput{false};
     led::transport::UdpEndpoint lastInputSource;
     led::Status inputStatus;
+    const bool diagnosticsEnabled = hostDiagnosticsEnabled();
     std::thread inputThread([&]() {
         auto lastStatsLog = std::chrono::steady_clock::now();
         while (!stopInput.load() && !stopEvent.requested()) {
@@ -766,7 +803,7 @@ int runServeLiveCaptureMode(int argc, char** argv) {
             led::transport::UdpEndpoint source;
             auto receiveStatus = inputReceiver.receive(event, source);
             const auto now = std::chrono::steady_clock::now();
-            if (now - lastStatsLog >= std::chrono::seconds(1)) {
+            if (diagnosticsEnabled && now - lastStatsLog >= std::chrono::seconds(1)) {
                 const auto stats = inputReceiver.stats();
                 if (stats.eventsReceived > 0) {
                     std::cout << "Host input live stats: events=" << stats.eventsReceived
@@ -955,7 +992,7 @@ int runServeLiveCaptureMode(int argc, char** argv) {
                 }
             }
         }
-        if (now - lastVideoStatsLog >= std::chrono::seconds(1)) {
+        if (diagnosticsEnabled && now - lastVideoStatsLog >= std::chrono::seconds(1)) {
             const auto [receiveAckStats, renderAckStats] = snapshotFrameAckStats(frameAckTracker);
             std::cout << "Host video live stats: frames=" << capturedFrames
                       << " nals=" << nalUnitsSent
@@ -1032,9 +1069,10 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     const auto inputPort = argc >= 10 ? parsePort(argv[9], 17691) : std::uint16_t{17691};
     led::host::InputInjectionBackend backend = led::host::InputInjectionBackend::sendInput;
     if (argc >= 11 && !led::host::parseInputInjectionBackend(argv[10], backend)) {
-        std::cerr << "Usage: led_host_app --serve-mjpeg-capture [control-port] [udp-port] [frames] [fps] [quality-percent] [width] [height] [input-port] [dry-run|sendinput]\n";
+        std::cerr << "Usage: led_host_app --serve-mjpeg-capture [control-port] [udp-port] [frames] [fps] [quality-percent] [width] [height] [input-port] [dry-run|sendinput] [keep-monitor-on-exit]\n";
         return 1;
     }
+    const bool keepMonitorOnExit = argc >= 12 && std::string(argv[11]) == "keep-monitor-on-exit";
     const auto actualFps = fps == 0 ? std::uint32_t{60} : fps;
     const auto mode = makeVideoMode(width, height, actualFps, 0);
 
@@ -1059,6 +1097,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     led::host::InputInjector injector(displayManager, backend);
     std::atomic_bool stopInput{false};
     led::Status inputStatus;
+    const bool diagnosticsEnabled = hostDiagnosticsEnabled();
     std::thread inputThread([&]() {
         auto lastStatsLog = std::chrono::steady_clock::now();
         while (!stopInput.load() && !stopEvent.requested()) {
@@ -1066,7 +1105,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             led::transport::UdpEndpoint source;
             auto receiveStatus = inputReceiver.receive(event, source);
             const auto now = std::chrono::steady_clock::now();
-            if (now - lastStatsLog >= std::chrono::seconds(1)) {
+            if (diagnosticsEnabled && now - lastStatsLog >= std::chrono::seconds(1)) {
                 const auto stats = inputReceiver.stats();
                 if (stats.eventsReceived > 0) {
                     std::cout << "Host input live stats: events=" << stats.eventsReceived
@@ -1152,6 +1191,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     const float idleRefreshQuality = std::max(quality, 0.85F);
     led::host::CapturedFrame previousFrame;
     const auto keyFrameInterval = std::max<std::uint32_t>(1, actualFps);
+    const auto sessionStart = std::chrono::steady_clock::now();
     std::uint32_t idleFrames = 0;
     bool idleRefreshArmed = true;
     bool forceRecoveryFrame = false;
@@ -1209,9 +1249,13 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
         bool idleRefresh = false;
         if (dirty.empty) {
             ++idleFrames;
-            if (idleRefreshArmed && idleFrames >= std::max<std::uint32_t>(1, actualFps / 5)) {
+            const auto refreshInterval = idleRefreshArmed
+                ? std::max<std::uint32_t>(1, actualFps / 5)
+                : std::max<std::uint32_t>(1, actualFps);
+            if (idleFrames >= refreshInterval) {
                 dirty = fullDirtyRect(frame.width, frame.height);
                 idleRefresh = true;
+                idleFrames = 0;
                 idleRefreshArmed = false;
             } else {
                 ++capturedFrames;
@@ -1294,7 +1338,11 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             ++idleRefreshFrames;
         }
         const auto now = std::chrono::steady_clock::now();
-        if (now - lastVideoStatsLog >= std::chrono::seconds(1)) {
+        if (renderAckTimedOut(frameAckTracker, now, sessionStart, std::chrono::seconds(5))) {
+            status = led::Status::unavailable("MJPEG render ack timed out; client is likely disconnected");
+            break;
+        }
+        if (diagnosticsEnabled && now - lastVideoStatsLog >= std::chrono::seconds(1)) {
             const auto [receiveAckStats, renderAckStats] = snapshotFrameAckStats(frameAckTracker);
             std::cout << "Host MJPEG live stats: frames=" << capturedFrames
                       << " packets=" << packetsSent
@@ -1332,7 +1380,11 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
       stopInputThread();
       displayManager.destroyVirtualDisplay();
       displayManager.restoreDisplayLayout();
-      driverMonitor.release();
+      if (keepMonitorOnExit && stopEvent.requested() && status.isOk()) {
+          driverMonitor.disarm();
+      } else {
+          driverMonitor.release();
+      }
       if (status.isOk() && !inputStatus.isOk()) {
           status = inputStatus;
       }

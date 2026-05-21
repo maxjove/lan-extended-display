@@ -71,9 +71,12 @@ class ClientController:
         if not host:
             return
         with self.lock:
-            if self.process is not None and self.process.poll() is None and self.last_host == host:
-                return
+            replaced = self.process is not None and self.process.poll() is None
+            if self.process is not None and self.process.poll() is None:
+                print(f"replacing active client session for host {self.last_host or 'unknown'}", flush=True)
             self.stop_locked()
+            if replaced:
+                time.sleep(0.25)
             if self.video_mode == "mjpeg":
                 command = [
                     self.client_bin,
@@ -100,19 +103,32 @@ class ClientController:
             env = os.environ.copy()
             env.setdefault("DISPLAY", ":0")
             env.setdefault("XAUTHORITY", os.path.expanduser("~/.Xauthority"))
-            self.process = subprocess.Popen(command, env=env)
+            print(f"starting client for host {host} control={control_port} input={input_port}", flush=True)
+            self.process = subprocess.Popen(command, env=env, start_new_session=True)
             self.last_host = host
 
     def stop_locked(self):
         if self.process is None:
             return
         if self.process.poll() is None:
-            self.process.terminate()
+            print(f"stopping client pid={self.process.pid}", flush=True)
             try:
-                self.process.wait(timeout=3)
+                os.killpg(self.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                self.process.terminate()
+            try:
+                self.process.wait(timeout=1)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=3)
+                print(f"client pid={self.process.pid} did not exit after SIGTERM; killing", flush=True)
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    self.process.kill()
+                self.process.wait(timeout=2)
         self.process = None
 
     def stop(self):
@@ -165,6 +181,7 @@ class DiscoveryService:
                     host = fields.get("host", address[0])
                     control = int(fields.get("control", CONTROL_PORT))
                     input_port = int(fields.get("input", INPUT_PORT))
+                    print(f"connect command from {address[0]} host={host} control={control} input={input_port}", flush=True)
                     self.controller.start(host, control, input_port)
 
 

@@ -543,7 +543,7 @@ int runReceiveTestStreamMode(int argc, char** argv) {
         inputOptions.inputPort = inputPort;
         inputOptions.hideLocalCursor = false;
         inputOptions.renderer = nullptr;
-        inputThread = std::thread([&]() {
+        inputThread = std::thread([&, inputOptions]() {
             led::client::X11InputCapture capture;
             inputStatus = capture.run(inputOptions, &stopInput, inputStats);
         });
@@ -933,7 +933,7 @@ int runReceiveMjpegStreamMode(int argc, char** argv) {
         inputOptions.inputPort = inputPort;
         inputOptions.hideLocalCursor = false;
         inputOptions.renderer = &renderer;
-        inputThread = std::thread([&]() {
+        inputThread = std::thread([&, inputOptions]() {
             led::client::X11InputCapture capture;
             inputStatus = capture.run(inputOptions, &stopInput, inputStats);
         });
