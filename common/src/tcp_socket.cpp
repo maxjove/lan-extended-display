@@ -358,6 +358,51 @@ bool TcpStream::isOpen() const {
     return socket_ != kInvalidSocket;
 }
 
+bool TcpStream::peerClosed() const {
+    if (!isOpen()) {
+        return true;
+    }
+#if defined(_WIN32)
+    const auto nativeSocket = static_cast<SOCKET>(socket_);
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(nativeSocket, &readSet);
+    timeval timeout{};
+    const int ready = select(0, &readSet, nullptr, nullptr, &timeout);
+    if (ready <= 0) {
+        return false;
+    }
+    char byte = '\0';
+    const auto received = recv(nativeSocket, &byte, 1, MSG_PEEK);
+    if (received == 0) {
+        return true;
+    }
+    if (received < 0) {
+        const int error = WSAGetLastError();
+        return error != WSAEWOULDBLOCK && error != WSAEINPROGRESS;
+    }
+    return false;
+#else
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(socket_, &readSet);
+    timeval timeout{};
+    const int ready = select(socket_ + 1, &readSet, nullptr, nullptr, &timeout);
+    if (ready <= 0) {
+        return false;
+    }
+    char byte = '\0';
+    const auto received = recv(socket_, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (received == 0) {
+        return true;
+    }
+    if (received < 0) {
+        return errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR;
+    }
+    return false;
+#endif
+}
+
 const UdpEndpoint& TcpStream::peerEndpoint() const {
     return peerEndpoint_;
 }

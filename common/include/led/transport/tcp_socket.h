@@ -25,6 +25,7 @@ public:
     void close();
 
     [[nodiscard]] bool isOpen() const;
+    [[nodiscard]] bool peerClosed() const;
     [[nodiscard]] const UdpEndpoint& peerEndpoint() const;
 
 private:

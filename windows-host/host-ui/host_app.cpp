@@ -235,18 +235,6 @@ std::pair<FrameAckStats, FrameAckStats> snapshotFrameAckStats(FrameAckTracker& t
     return {tracker.receiveStats, tracker.renderStats};
 }
 
-bool renderAckTimedOut(
-    FrameAckTracker& tracker,
-    std::chrono::steady_clock::time_point now,
-    std::chrono::steady_clock::time_point sessionStart,
-    std::chrono::seconds timeout) {
-    std::scoped_lock lock(tracker.mutex);
-    if (tracker.renderStats.acks == 0) {
-        return now - sessionStart > timeout;
-    }
-    return now - tracker.lastRenderAck > timeout;
-}
-
 struct DirtyRect {
     std::uint32_t x{0};
     std::uint32_t y{0};
@@ -1191,7 +1179,6 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     const float idleRefreshQuality = std::max(quality, 0.85F);
     led::host::CapturedFrame previousFrame;
     const auto keyFrameInterval = std::max<std::uint32_t>(1, actualFps);
-    const auto sessionStart = std::chrono::steady_clock::now();
     std::uint32_t idleFrames = 0;
     bool idleRefreshArmed = true;
     bool forceRecoveryFrame = false;
@@ -1338,10 +1325,6 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             ++idleRefreshFrames;
         }
         const auto now = std::chrono::steady_clock::now();
-        if (renderAckTimedOut(frameAckTracker, now, sessionStart, std::chrono::seconds(5))) {
-            status = led::Status::unavailable("MJPEG render ack timed out; client is likely disconnected");
-            break;
-        }
         if (diagnosticsEnabled && now - lastVideoStatsLog >= std::chrono::seconds(1)) {
             const auto [receiveAckStats, renderAckStats] = snapshotFrameAckStats(frameAckTracker);
             std::cout << "Host MJPEG live stats: frames=" << capturedFrames

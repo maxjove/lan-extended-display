@@ -1050,6 +1050,12 @@ int runReceiveMjpegStreamMode(int argc, char** argv) {
             if (expectedFrames == 0) {
                 ++idleTimeouts;
                 if (frames > 0) {
+                    if (stream.peerClosed()) {
+                        led::logWarn("MJPEG stream ended because host control connection closed");
+                        closedFromActiveIdle = true;
+                        status = led::Status::ok();
+                        break;
+                    }
                     if (idleTimeouts < kMjpegActiveIdleTimeouts) {
                         if ((idleTimeouts % 10) == 0) {
                             led::logWarn("waiting for MJPEG stream to resume; keeping display session open");
