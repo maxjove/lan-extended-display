@@ -165,7 +165,10 @@ class DiscoveryService:
                 now = time.monotonic()
                 if now - last_beacon >= 3.0:
                     data = self.beacon().encode("utf-8")
-                    sock.sendto(data, ("255.255.255.255", DISCOVERY_PORT))
+                    try:
+                        sock.sendto(data, ("255.255.255.255", DISCOVERY_PORT))
+                    except OSError as exc:
+                        print(f"discovery beacon failed: {exc}", flush=True)
                     last_beacon = now
                 try:
                     raw, address = sock.recvfrom(2048)
@@ -175,7 +178,10 @@ class DiscoveryService:
                     break
                 message = raw.decode("utf-8", errors="ignore")
                 if message.startswith("LED_DISCOVER_V1"):
-                    sock.sendto(self.beacon().encode("utf-8"), (address[0], DISCOVERY_PORT))
+                    try:
+                        sock.sendto(self.beacon().encode("utf-8"), (address[0], DISCOVERY_PORT))
+                    except OSError as exc:
+                        print(f"discovery reply failed to {address[0]}: {exc}", flush=True)
                 elif message.startswith("LED_CONNECT_V1"):
                     fields = parse_fields(message)
                     host = fields.get("host", address[0])

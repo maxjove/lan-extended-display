@@ -58,6 +58,7 @@ HANDLE g_hostStdout{nullptr};
 HANDLE g_hostStderr{nullptr};
 HANDLE g_activeMonitorEvent{nullptr};
 bool g_virtualDisplayInstalled{false};
+bool g_virtualDisplayRemoving{false};
 bool g_sessionRestarting{false};
 std::atomic_bool g_discoveryStop{false};
 std::thread g_discoveryThread;
@@ -733,14 +734,16 @@ void requestDriverMonitorDestroy() {
 }
 
 void removeVirtualDisplayIfInstalled(HWND window, bool removeDevice = true) {
-    if (!g_virtualDisplayInstalled) {
+    if (!g_virtualDisplayInstalled || g_virtualDisplayRemoving) {
         return;
     }
+    g_virtualDisplayRemoving = true;
+    g_virtualDisplayInstalled = false;
     destroyVirtualMonitor(window);
     if (removeDevice) {
         removeVirtualDisplayDevice(window);
     }
-    g_virtualDisplayInstalled = false;
+    g_virtualDisplayRemoving = false;
 }
 
 bool hostStillRunning() {

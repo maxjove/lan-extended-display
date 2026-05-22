@@ -235,6 +235,20 @@ std::pair<FrameAckStats, FrameAckStats> snapshotFrameAckStats(FrameAckTracker& t
     return {tracker.receiveStats, tracker.renderStats};
 }
 
+bool frameAckTimedOut(
+    FrameAckTracker& tracker,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::seconds timeout) {
+    std::scoped_lock lock(tracker.mutex);
+    if (tracker.receiveStats.acks == 0 && tracker.renderStats.acks == 0) {
+        return false;
+    }
+    const auto latestAck = tracker.lastReceiveAck > tracker.lastRenderAck
+        ? tracker.lastReceiveAck
+        : tracker.lastRenderAck;
+    return latestAck.time_since_epoch().count() != 0 && now - latestAck > timeout;
+}
+
 struct DirtyRect {
     std::uint32_t x{0};
     std::uint32_t y{0};
@@ -1164,6 +1178,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     FrameAckTracker frameAckTracker;
     auto frameAckThread = startFrameAckListener(frameAckTracker, stopAck);
     const auto frameInterval = std::chrono::microseconds(1000000 / actualFps);
+    const auto clientLivenessTimeout = std::chrono::seconds(60);
     auto nextFrameTime = std::chrono::steady_clock::now();
     auto lastVideoStatsLog = nextFrameTime;
     std::uint32_t capturedFrames = 0;
@@ -1210,6 +1225,18 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     };
 
     while (!stopEvent.requested() && (frameCount == 0 || capturedFrames < frameCount)) {
+        const auto loopNow = std::chrono::steady_clock::now();
+        if (stream.peerClosed()) {
+            status = led::Status::unavailable("MJPEG client control connection closed");
+            led::logWarn(status.message());
+            break;
+        }
+        if (frameAckTimedOut(frameAckTracker, loopNow, clientLivenessTimeout)) {
+            status = led::Status::unavailable("MJPEG client acknowledgements timed out");
+            led::logWarn(status.message());
+            break;
+        }
+
         led::host::CapturedFrame frame;
         status = capture.captureNextFrame(frame);
         if (!status.isOk()) {
