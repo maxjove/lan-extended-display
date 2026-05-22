@@ -541,7 +541,11 @@ int runReceiveTestStreamMode(int argc, char** argv) {
         led::client::X11InputCaptureOptions inputOptions;
         inputOptions.hostAddress = hostAddress;
         inputOptions.inputPort = inputPort;
-        inputOptions.hideLocalCursor = false;
+        inputOptions.grabPointer = false;
+        inputOptions.grabKeyboard = false;
+        inputOptions.hideLocalCursor = true;
+        inputOptions.forwardPointerEvents = false;
+        inputOptions.forwardKeyboardEvents = false;
         inputOptions.renderer = nullptr;
         inputThread = std::thread([&, inputOptions]() {
             led::client::X11InputCapture capture;
@@ -931,8 +935,12 @@ int runReceiveMjpegStreamMode(int argc, char** argv) {
         led::client::X11InputCaptureOptions inputOptions;
         inputOptions.hostAddress = hostAddress;
         inputOptions.inputPort = inputPort;
-        inputOptions.hideLocalCursor = false;
-        inputOptions.renderer = &renderer;
+        inputOptions.grabPointer = false;
+        inputOptions.grabKeyboard = false;
+        inputOptions.hideLocalCursor = true;
+        inputOptions.forwardPointerEvents = false;
+        inputOptions.forwardKeyboardEvents = false;
+        inputOptions.renderer = nullptr;
         inputThread = std::thread([&, inputOptions]() {
             led::client::X11InputCapture capture;
             inputStatus = capture.run(inputOptions, &stopInput, inputStats);

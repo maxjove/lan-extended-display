@@ -258,6 +258,9 @@ led::Status X11InputCapture::run(
             bool hasInput = false;
             switch (event.type) {
             case MotionNotify: {
+                if (!options.forwardPointerEvents) {
+                    break;
+                }
                 const auto x = normalizedCoordinate(event.xmotion.x, width);
                 const auto y = normalizedCoordinate(event.xmotion.y, height);
                 if (options.renderer != nullptr) {
@@ -270,6 +273,9 @@ led::Status X11InputCapture::run(
             }
             case ButtonPress:
             case ButtonRelease: {
+                if (!options.forwardPointerEvents) {
+                    break;
+                }
                 if (hasPendingMotion) {
                     status = sendInputEvent(pendingMotion);
                     if (!status.isOk()) {
@@ -310,6 +316,9 @@ led::Status X11InputCapture::run(
             }
             case KeyPress:
             case KeyRelease: {
+                if (!options.forwardKeyboardEvents) {
+                    break;
+                }
                 if (hasPendingMotion) {
                     status = sendInputEvent(pendingMotion);
                     if (!status.isOk()) {

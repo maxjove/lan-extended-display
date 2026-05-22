@@ -18,6 +18,8 @@ struct X11InputCaptureOptions {
     bool grabPointer{true};
     bool grabKeyboard{true};
     bool hideLocalCursor{false};
+    bool forwardPointerEvents{true};
+    bool forwardKeyboardEvents{true};
     Renderer* renderer{nullptr};
 };
 

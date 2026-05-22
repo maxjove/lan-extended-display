@@ -43,6 +43,7 @@ constexpr int kMaxDeviceMenuItems = 64;
 constexpr UINT_PTR kMonitorTimerId = 2001;
 constexpr std::uint16_t kDiscoveryPort = 17659;
 constexpr const wchar_t* kWindowClassName = L"LanExtendedDisplayTrayWindow";
+constexpr const wchar_t* kSingleInstanceMutexName = L"Local\\LanExtendedDisplayTraySingleInstance";
 constexpr const wchar_t* kStopEventName = L"Local\\LanExtendedDisplayHostStop";
 constexpr const wchar_t* kDriverActiveMonitorEventName = L"Global\\LanExtendedDisplayActiveMonitor";
 constexpr const wchar_t* kDriverCreateMonitorEventName = L"Global\\LanExtendedDisplayCreateMonitor";
@@ -66,6 +67,7 @@ std::mutex g_devicesMutex;
 HICON g_trayIcon{nullptr};
 int g_jpegQuality = 55;
 std::uint64_t g_hostGeneration = 0;
+HANDLE g_singleInstanceMutex{nullptr};
 
 struct ClientDevice {
     std::string address;
@@ -1275,6 +1277,17 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    g_singleInstanceMutex = CreateMutexW(nullptr, TRUE, kSingleInstanceMutexName);
+    if (g_singleInstanceMutex == nullptr) {
+        return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        logTray(L"tray process already running; exiting duplicate instance");
+        CloseHandle(g_singleInstanceMutex);
+        g_singleInstanceMutex = nullptr;
+        return 0;
+    }
+
     loadTraySettings();
     logTray(L"tray process starting");
     WNDCLASSW windowClass{};
@@ -1305,6 +1318,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
+    }
+    if (g_singleInstanceMutex != nullptr) {
+        ReleaseMutex(g_singleInstanceMutex);
+        CloseHandle(g_singleInstanceMutex);
+        g_singleInstanceMutex = nullptr;
     }
     return static_cast<int>(message.wParam);
 }
