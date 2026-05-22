@@ -13,8 +13,9 @@
 
 已验证环境：
 
-- Windows 11 主机，双物理屏 + 1 个虚拟扩展屏。
-- Linux ARM64 客户端，局域网 IP `10.168.20.227`。
+- Windows 11 主机：`Microsoft Windows 11 企业版 Insider Preview`，版本 `10.0.26220`，`64-bit`。
+- Linux ARM64 客户端：`UOS Desktop 20 Professional`，内核 `4.19.0-arm64-desktop`，架构 `aarch64`，局域网 IP `10.168.20.227`。
+- Linux 客户端明确面向国产 Linux 桌面系统兼容，当前已在统信 UOS ARM64 上实测；同类系统需要提供 X11、systemd user service、libjpeg-turbo、Python 3/PyQt5 和 CMake/C++20 构建环境。
 - 局域网内可自动发现客户端，也可以在 Windows 托盘菜单手动输入 IP 启动。
 
 已处理的关键体验问题：
@@ -170,18 +171,19 @@ sudo apt-get install -y --no-install-recommends \
   build-essential cmake libx11-dev libxext-dev libjpeg-turbo8-dev python3 python3-pyqt5
 ```
 
-## 性能数据
+## 当前性能数据
 
-以下数据来自当前开发过程中的局域网真机测试，用于描述“目前水平”，不是硬件或协议上限。无线网络、桌面变化幅度、画质档位和 Linux 图形栈都会影响结果。
+以下数据只记录当前 MJPEG 扩展屏链路的实测状态，用于描述“目前水平”，不是硬件或协议上限。无线网络、桌面变化幅度、画质档位和 Linux 图形栈都会影响结果。
 
-| 场景 | 观察结果 |
+| 指标 | 当前结果 |
 | --- | --- |
-| H.264 文件流早期链路验证 | Windows `10.168.20.134` -> ARM64 `10.168.20.227`，13 个 NAL、15 个 RTP 包、0 丢包/乱序/drop、9 个 decoded/raw frame，估算单向耗时约 `42.7ms`，jitter 约 `69us`。 |
-| 1280x720@30 早期实时链路 | DXGI/Media Foundation/GStreamer 链路收到 108 个 NAL，0 RTP 丢包/乱序/drop，解码 49 个 `1280x720` raw frame；同轮输入收到 5 个事件，0 malformed/gap/乱序。 |
-| 当前 MJPEG 扩展屏链路 | 目标 `1920x1080@60`，支持 dirty region 更新；Linux 端使用 libjpeg-turbo direct BGRx 解码路径，避免 GStreamer JPEG 管线额外排队。 |
+| 工作模式 | Windows 虚拟扩展屏 `1920x1080@60`，MJPEG over UDP，支持 dirty region 更新，输入独立 UDP 回传。 |
 | Windows 端资源占用样例 | 任务管理器观察到 `led_host_app.exe` 约 `8% CPU`、`58.9 MB` 内存、约 `4.1 Mbps` 网络、约 `0.1 MB/s` 磁盘显示值。磁盘值主要来自日志/系统统计采样，不是视频写盘。 |
-| Linux 端长时间运行样例 | 客户端日志出现过 `frames=46329`、`packets=2475942`、`decoded=39120`、`rendered=39120`、平均帧大小约 `58 KB` 的长跑统计；较低质量档位时平均帧大小约 `38-39 KB`。 |
-| 操作响应 | 初期鼠标/键盘存在约 `500ms-1s` 级别可感知滞后；经过本地指针策略、输入独立 UDP 链路、ACK/健康检测和解码路径优化后，当前主观操作已经明显跟手。 |
+| Linux 端解码/渲染 | UOS ARM64 上使用 libjpeg-turbo direct BGRx 解码路径，避免 GStreamer JPEG 管线额外排队。 |
+| Linux 端长时间运行样例 | 客户端日志样例：`frames=46329`、`packets=2475942`、`decoded=39120`、`rendered=39120`，平均帧大小约 `58 KB`；较低质量档位时平均帧大小约 `38-39 KB`。 |
+| 当前响应时间 | MJPEG ACK 统计口径下，Windows 发帧到收到 Linux 接收 ACK 平均约 `149ms`，发帧到收到 Linux 渲染 ACK 平均约 `169ms`，观测峰值约 `790ms`。该数据是视频帧链路往返 ACK 时间，不等同于鼠标/键盘输入的纯事件延迟。 |
+| 当前操作响应 | 鼠标移动、点击和键盘输入通过独立 UDP 输入链路回传，当前主观操作已经明显跟手；更精确的端到端延迟仍需 LED/高速相机或系统级时间戳测试。 |
+| 当前画质表现 | 质量 `55/75/85/90` 可选，数值越高文字和图片越清晰，但会增加 Windows JPEG 编码、Linux JPEG 解码和网络带宽压力。 |
 
 ### 画质与延迟取舍
 
