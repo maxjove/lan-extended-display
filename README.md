@@ -196,6 +196,15 @@ sudo apt-get install -y --no-install-recommends \
 
 当前主要成本仍在 Windows 端 JPEG 编码和 Linux 端 JPEG 解码/渲染。如果后续要进一步接近“真实外接屏”的观感，优先方向是 GPU 编码/解码链路、低延迟 H.264/HEVC/AV1、或更高效的无损/近无损局部更新策略。
 
+## 许可证与商业授权
+
+本项目采用 [PolyForm Noncommercial License 1.0.0](LICENSE)。
+
+- 允许非商业目的使用、学习、研究、修改和分发。
+- 商业使用需要获得版权持有者的单独商业授权。
+- 商业使用包括但不限于：集成到商业产品、企业内部生产环境使用、作为商业服务的一部分提供、销售或转售本项目或其衍生版本。
+- 分发本项目或衍生版本时，需要同时保留 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
+
 ## 设计文档
 
 - [实现方案](lan-extended-display-implementation-plan.md)
