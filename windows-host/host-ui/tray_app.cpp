@@ -706,6 +706,7 @@ bool createVirtualMonitor(HWND window) {
 }
 
 bool destroyVirtualMonitor(HWND window) {
+    (void)window;
     logTray(L"destroy virtual monitor requested");
     if (ensureActiveMonitorEvent()) {
         ResetEvent(g_activeMonitorEvent);
@@ -718,12 +719,12 @@ bool destroyVirtualMonitor(HWND window) {
         }
         return true;
     }
-    const bool ok = runElevatedPowerShellScript(window, driverScriptPath(L"remove-virtual-display.ps1"));
     if (g_activeMonitorEvent != nullptr) {
         CloseHandle(g_activeMonitorEvent);
         g_activeMonitorEvent = nullptr;
     }
-    return ok;
+    logTray(L"destroy virtual monitor skipped: driver control channel unavailable");
+    return false;
 }
 
 void requestDriverMonitorDestroy() {
@@ -735,7 +736,7 @@ void requestDriverMonitorDestroy() {
     signalDriverEvent(kDriverDestroyMonitorEventName);
 }
 
-void removeVirtualDisplayIfInstalled(HWND window, bool removeDevice = true) {
+void removeVirtualDisplayIfInstalled(HWND window, bool removeDevice = false) {
     if (!g_virtualDisplayInstalled || g_virtualDisplayRemoving) {
         return;
     }

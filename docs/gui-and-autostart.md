@@ -21,10 +21,10 @@ The tray icon menu provides:
 - `Start by IP...`: sends a connect command to a manually entered Linux client IP, then starts the extended display
 - `Refresh clients`: broadcasts a discovery probe on UDP port `17659`
 - `Quality`: selects MJPEG quality: `Fast 45`, `Balanced 55`, or `Sharp 65`. The value is saved in `led_host_tray.ini`; if a display session is running, the tray restarts that session automatically so the new quality takes effect.
-- `Stop extended display`: asks the running host to stop through `Local\LanExtendedDisplayHostStop`, then removes the IddCx root display device so it disappears from Windows display settings
+- `Stop extended display`: asks the running host to stop through `Local\LanExtendedDisplayHostStop`, then asks the IddCx driver to detach the virtual monitor without requiring administrator confirmation
 - `Install firewall rules`: asks for administrator permission and opens inbound TCP `17660` plus UDP `17659`, `17670`, and `17691` on private/domain networks
 - `Open log`: opens `led_host_tray.log`
-- `Exit`: stops the host if it was started by the tray app, removes the virtual display device, then exits the tray app
+- `Exit`: stops the host if it was started by the tray app, detaches the virtual monitor, then exits the tray app
 
 Keep `led_host_tray.exe` and `led_host_app.exe` in the same directory.
 The driver scripts are resolved from the source tree, so the current development layout expects the tray app under `build\windows-host\Release`.
