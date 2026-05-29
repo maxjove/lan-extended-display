@@ -4,7 +4,7 @@ Class=Display
 ClassGuid={4D36E968-E325-11CE-BFC1-08002BE10318}
 Provider=%ProviderName%
 CatalogFile=led_idd.cat
-DriverVer=05/20/2026,0.1.0.0
+DriverVer=05/29/2026,0.1.1.0
 PnpLockdown=1
 
 [DestinationDirs]

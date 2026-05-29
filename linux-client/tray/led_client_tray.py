@@ -58,6 +58,7 @@ class ClientController:
         self.process = None
         self.lock = threading.Lock()
         self.last_host = ""
+        self.last_recover_restart = 0.0
 
     def is_running(self):
         with self.lock:
@@ -66,12 +67,18 @@ class ClientController:
     def status(self):
         return "running" if self.is_running() else "ready"
 
-    def start(self, host, control_port=CONTROL_PORT, input_port=INPUT_PORT):
+    def start(self, host, control_port=CONTROL_PORT, input_port=INPUT_PORT, recover=False):
         host = host.strip()
         if not host:
             return
         with self.lock:
+            now = time.monotonic()
             replaced = self.process is not None and self.process.poll() is None
+            if recover and replaced and host == self.last_host and now - self.last_recover_restart < 20.0:
+                print(f"ignoring throttled recovery command for active host {host}", flush=True)
+                return
+            if recover:
+                self.last_recover_restart = now
             if self.process is not None and self.process.poll() is None:
                 print(f"replacing active client session for host {self.last_host or 'unknown'}", flush=True)
             self.stop_locked()
@@ -187,8 +194,12 @@ class DiscoveryService:
                     host = fields.get("host", address[0])
                     control = int(fields.get("control", CONTROL_PORT))
                     input_port = int(fields.get("input", INPUT_PORT))
-                    print(f"connect command from {address[0]} host={host} control={control} input={input_port}", flush=True)
-                    self.controller.start(host, control, input_port)
+                    recover = fields.get("reason", "") == "recover"
+                    print(
+                        f"connect command from {address[0]} host={host} control={control} input={input_port} recover={recover}",
+                        flush=True,
+                    )
+                    self.controller.start(host, control, input_port, recover=recover)
 
 
 class TrayUi:

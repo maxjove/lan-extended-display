@@ -10,11 +10,20 @@
 
 namespace led::host {
 
+struct CaptureDirtyRect {
+    std::uint32_t x{0};
+    std::uint32_t y{0};
+    std::uint32_t width{0};
+    std::uint32_t height{0};
+};
+
 struct CapturedFrame {
     std::uint64_t frameId{0};
     std::uint64_t timestampUs{0};
     std::uint32_t width{0};
     std::uint32_t height{0};
+    bool dirtyRectsKnown{false};
+    std::vector<CaptureDirtyRect> dirtyRects;
     std::vector<std::uint8_t> bgra;
 };
 

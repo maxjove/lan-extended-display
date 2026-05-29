@@ -41,16 +41,20 @@ struct DeviceState {
     WDFDEVICE wdfDevice = nullptr;
     IDDCX_ADAPTER adapter = nullptr;
     IDDCX_MONITOR monitor = nullptr;
+    bool monitorDeparting = false;
+    ULONGLONG lastMonitorDepartureTick = 0;
     SwapChainPump pump;
     ControlChannel control;
 };
 
 DeviceState g_state;
 CRITICAL_SECTION g_stateLock;
+CRITICAL_SECTION g_pumpLock;
 INIT_ONCE g_lockInitOnce = INIT_ONCE_STATIC_INIT;
 
 BOOL CALLBACK InitLockOnce(PINIT_ONCE, PVOID, PVOID*) {
     InitializeCriticalSection(&g_stateLock);
+    InitializeCriticalSection(&g_pumpLock);
     return TRUE;
 }
 
@@ -228,6 +232,9 @@ DWORD WINAPI SwapChainThreadProc(void* context) {
 }
 
 void StopSwapChainPump(SwapChainPump* pump) {
+    EnsureLock();
+    EnterCriticalSection(&g_pumpLock);
+
     if (pump->stopEvent != nullptr) {
         SetEvent(pump->stopEvent);
     }
@@ -236,6 +243,7 @@ void StopSwapChainPump(SwapChainPump* pump) {
         const DWORD wait = WaitForSingleObject(pump->thread, 5000);
         if (wait == WAIT_TIMEOUT) {
             DebugLog(L"Timed out waiting for swap-chain thread to stop");
+            LeaveCriticalSection(&g_pumpLock);
             return;
         }
     }
@@ -263,10 +271,13 @@ void StopSwapChainPump(SwapChainPump* pump) {
 
     pump->surfaceEvent = nullptr;
     pump->swapChain = nullptr;
+    LeaveCriticalSection(&g_pumpLock);
 }
 
 NTSTATUS StartSwapChainPump(SwapChainPump* pump, const IDARG_IN_SETSWAPCHAIN* args) {
     StopSwapChainPump(pump);
+    EnsureLock();
+    EnterCriticalSection(&g_pumpLock);
 
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
@@ -274,6 +285,7 @@ NTSTATUS StartSwapChainPump(SwapChainPump* pump, const IDARG_IN_SETSWAPCHAIN* ar
     HRESULT hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory));
     if (FAILED(hr) || factory == nullptr) {
         DebugLogHresult(L"CreateDXGIFactory2 failed", hr);
+        LeaveCriticalSection(&g_pumpLock);
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -282,6 +294,7 @@ NTSTATUS StartSwapChainPump(SwapChainPump* pump, const IDARG_IN_SETSWAPCHAIN* ar
     if (FAILED(hr) || adapter == nullptr) {
         factory->Release();
         DebugLogHresult(L"EnumAdapterByLuid failed", hr);
+        LeaveCriticalSection(&g_pumpLock);
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -308,6 +321,7 @@ NTSTATUS StartSwapChainPump(SwapChainPump* pump, const IDARG_IN_SETSWAPCHAIN* ar
         adapter->Release();
         factory->Release();
         DebugLogHresult(L"D3D11CreateDevice failed", hr);
+        LeaveCriticalSection(&g_pumpLock);
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -318,6 +332,7 @@ NTSTATUS StartSwapChainPump(SwapChainPump* pump, const IDARG_IN_SETSWAPCHAIN* ar
         adapter->Release();
         factory->Release();
         DebugLogHresult(L"IDXGIDevice query failed", hr);
+        LeaveCriticalSection(&g_pumpLock);
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -330,22 +345,32 @@ NTSTATUS StartSwapChainPump(SwapChainPump* pump, const IDARG_IN_SETSWAPCHAIN* ar
     pump->dxgiDevice = dxgiDevice;
     pump->stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (pump->stopEvent == nullptr) {
+        LeaveCriticalSection(&g_pumpLock);
         StopSwapChainPump(pump);
         return STATUS_UNSUCCESSFUL;
     }
 
     pump->thread = CreateThread(nullptr, 0, SwapChainThreadProc, pump, 0, &pump->threadId);
     if (pump->thread == nullptr) {
+        LeaveCriticalSection(&g_pumpLock);
         StopSwapChainPump(pump);
         return STATUS_UNSUCCESSFUL;
     }
 
+    LeaveCriticalSection(&g_pumpLock);
     return STATUS_SUCCESS;
 }
 
 NTSTATUS CreateVirtualMonitor() {
     if (g_state.monitor != nullptr) {
         return STATUS_SUCCESS;
+    }
+    if (g_state.monitorDeparting) {
+        return STATUS_DEVICE_BUSY;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (g_state.lastMonitorDepartureTick != 0 && now - g_state.lastMonitorDepartureTick < 2000) {
+        return STATUS_DEVICE_BUSY;
     }
     if (g_state.adapter == nullptr) {
         return STATUS_DEVICE_NOT_READY;
@@ -394,20 +419,29 @@ NTSTATUS DestroyVirtualMonitor() {
         LeaveCriticalSection(&g_stateLock);
         return STATUS_SUCCESS;
     }
+    if (g_state.monitorDeparting) {
+        LeaveCriticalSection(&g_stateLock);
+        return STATUS_DEVICE_BUSY;
+    }
+    g_state.monitorDeparting = true;
+    g_state.monitor = nullptr;
     LeaveCriticalSection(&g_stateLock);
 
     StopSwapChainPump(&g_state.pump);
     const NTSTATUS status = IddCxMonitorDeparture(monitor);
+
+    EnterCriticalSection(&g_stateLock);
+    g_state.monitorDeparting = false;
+    g_state.lastMonitorDepartureTick = GetTickCount64();
+    if (!NT_SUCCESS(status)) {
+        g_state.monitor = monitor;
+    }
+    LeaveCriticalSection(&g_stateLock);
+
     if (!NT_SUCCESS(status)) {
         DebugLogStatus(L"IddCxMonitorDeparture failed", status);
         return status;
     }
-
-    EnterCriticalSection(&g_stateLock);
-    if (g_state.monitor == monitor) {
-        g_state.monitor = nullptr;
-    }
-    LeaveCriticalSection(&g_stateLock);
 
     DebugLog(L"Virtual monitor departed");
     return STATUS_SUCCESS;

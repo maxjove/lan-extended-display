@@ -42,6 +42,11 @@ constexpr int kMenuDeviceBase = 2000;
 constexpr int kMaxDeviceMenuItems = 64;
 constexpr UINT_PTR kMonitorTimerId = 2001;
 constexpr std::uint16_t kDiscoveryPort = 17659;
+constexpr DWORD kDeviceOnlineTimeoutMs = 15000;
+constexpr DWORD kRecoveryFirstAttemptDelayMs = 8000;
+constexpr DWORD kRecoveryAttemptIntervalMs = 15000;
+constexpr DWORD kRecoveryOfflineProbeIntervalMs = 30000;
+constexpr int kMaxRecoveryAttempts = 120;
 constexpr const wchar_t* kWindowClassName = L"LanExtendedDisplayTrayWindow";
 constexpr const wchar_t* kSingleInstanceMutexName = L"Local\\LanExtendedDisplayTraySingleInstance";
 constexpr const wchar_t* kStopEventName = L"Local\\LanExtendedDisplayHostStop";
@@ -61,6 +66,14 @@ HANDLE g_activeMonitorEvent{nullptr};
 bool g_virtualDisplayInstalled{false};
 bool g_virtualDisplayRemoving{false};
 bool g_sessionRestarting{false};
+bool g_userStopping{false};
+bool g_recoveryArmed{false};
+bool g_recoveryPending{false};
+bool g_recoveryTargetWasOffline{false};
+DWORD g_lastRecoveryAttemptTick{0};
+DWORD g_recoveryArmAfterTick{0};
+DWORD g_recoveryNotBeforeTick{0};
+int g_recoveryAttempts{0};
 std::atomic_bool g_discoveryStop{false};
 std::thread g_discoveryThread;
 std::mutex g_devicesMutex;
@@ -445,13 +458,26 @@ std::vector<ClientDevice> onlineDevices() {
     const DWORD now = GetTickCount();
     g_devices.erase(
         std::remove_if(g_devices.begin(), g_devices.end(), [&](const ClientDevice& device) {
-            return static_cast<LONG>(now - device.lastSeenTick) > 15000;
+            return static_cast<LONG>(now - device.lastSeenTick) > static_cast<LONG>(kDeviceOnlineTimeoutMs);
         }),
         g_devices.end());
     std::sort(g_devices.begin(), g_devices.end(), [](const ClientDevice& left, const ClientDevice& right) {
         return left.address < right.address;
     });
     return g_devices;
+}
+
+bool deviceSeenRecently(const std::string& address) {
+    if (address.empty()) {
+        return false;
+    }
+    std::scoped_lock lock(g_devicesMutex);
+    const DWORD now = GetTickCount();
+    const auto found = std::find_if(g_devices.begin(), g_devices.end(), [&](const ClientDevice& device) {
+        return device.address == address;
+    });
+    return found != g_devices.end() &&
+        static_cast<LONG>(now - found->lastSeenTick) <= static_cast<LONG>(kDeviceOnlineTimeoutMs);
 }
 
 std::wstring quote(const std::wstring& value) {
@@ -552,12 +578,32 @@ void loadTraySettings() {
         L"jpeg_quality",
         55,
         trayConfigPath().c_str()));
+    wchar_t target[64]{};
+    GetPrivateProfileStringW(
+        L"client",
+        L"last_target_ip",
+        L"",
+        target,
+        ARRAYSIZE(target),
+        trayConfigPath().c_str());
+    const std::string savedTarget = trimAscii(wideToUtf8(target));
+    if (isValidIpv4(savedTarget)) {
+        g_selectedClientIp = savedTarget;
+        rememberDevice(savedTarget, savedTarget, "saved");
+    }
 }
 
 void saveTraySettings() {
     wchar_t value[16]{};
     swprintf_s(value, L"%d", normalizeJpegQuality(g_jpegQuality));
     WritePrivateProfileStringW(L"video", L"jpeg_quality", value, trayConfigPath().c_str());
+    if (isValidIpv4(g_selectedClientIp)) {
+        WritePrivateProfileStringW(
+            L"client",
+            L"last_target_ip",
+            utf8ToWide(g_selectedClientIp).c_str(),
+            trayConfigPath().c_str());
+    }
 }
 
 bool installVirtualDisplay(HWND window) {
@@ -617,7 +663,7 @@ bool installFirewallRules(HWND window) {
     return exitCode == 0;
 }
 
-void notifyClientToConnect(const std::string& clientIp) {
+void notifyClientToConnect(const std::string& clientIp, const char* reason = nullptr) {
     if (clientIp.empty()) {
         return;
     }
@@ -629,11 +675,15 @@ void notifyClientToConnect(const std::string& clientIp) {
 
     std::ostringstream message;
     message << "LED_CONNECT_V1;host=" << hostIp << ";control=17660;input=17691;";
+    if (reason != nullptr && reason[0] != '\0') {
+        message << "reason=" << reason << ";";
+    }
     const bool ok = sendUdpMessage(clientIp, kDiscoveryPort, message.str());
     logTray(
-        L"send connect command to %ls through host %ls: %ls",
+        L"send connect command to %ls through host %ls reason=%ls: %ls",
         utf8ToWide(clientIp).c_str(),
         utf8ToWide(hostIp).c_str(),
+        reason == nullptr ? L"start" : utf8ToWide(reason).c_str(),
         ok ? L"ok" : L"failed");
 }
 
@@ -894,20 +944,163 @@ void stopHost() {
     hostStillRunning();
 }
 
+std::string defaultTargetIp() {
+    if (isValidIpv4(g_selectedClientIp)) {
+        return g_selectedClientIp;
+    }
+    const auto devices = onlineDevices();
+    if (!devices.empty()) {
+        return devices.front().address;
+    }
+    return {};
+}
+
+void resetRecoveryState() {
+    g_recoveryPending = false;
+    g_recoveryTargetWasOffline = false;
+    g_lastRecoveryAttemptTick = 0;
+    g_recoveryArmAfterTick = 0;
+    g_recoveryNotBeforeTick = 0;
+    g_recoveryAttempts = 0;
+}
+
+void beginRecovery(HWND window, const wchar_t* reason) {
+    if (!g_recoveryArmed || g_selectedClientIp.empty()) {
+        return;
+    }
+    if (!g_recoveryPending) {
+        g_recoveryPending = true;
+        g_recoveryTargetWasOffline = true;
+        g_lastRecoveryAttemptTick = 0;
+        g_recoveryNotBeforeTick = GetTickCount() + kRecoveryFirstAttemptDelayMs;
+        g_recoveryAttempts = 0;
+        logTray(L"auto recovery armed after %ls target=%ls", reason, utf8ToWide(g_selectedClientIp).c_str());
+        showBalloon(window, L"Reconnecting extended display", L"Network or client session was interrupted. Waiting for the Linux client to return.");
+    }
+}
+
+void pollRecovery(HWND window) {
+    if (g_selectedClientIp.empty() || g_userStopping || g_sessionRestarting) {
+        return;
+    }
+
+    const bool hostRunning = hostStillRunning();
+    const bool busy = g_virtualDisplayInstalled || hostRunning;
+    if (!busy) {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    const bool targetOnline = deviceSeenRecently(g_selectedClientIp);
+
+    if (!g_recoveryArmed) {
+        if (hostRunning && g_recoveryArmAfterTick != 0 &&
+            static_cast<LONG>(now - g_recoveryArmAfterTick) >= 0) {
+            g_recoveryArmed = true;
+            g_recoveryTargetWasOffline = !targetOnline;
+            logTray(L"auto recovery armed after stable session target=%ls", utf8ToWide(g_selectedClientIp).c_str());
+        } else {
+            return;
+        }
+    }
+
+    if (hostRunning && !g_recoveryPending) {
+        if (!targetOnline) {
+            if (!g_recoveryTargetWasOffline) {
+                logTray(L"target client went offline target=%ls", utf8ToWide(g_selectedClientIp).c_str());
+            }
+            g_recoveryTargetWasOffline = true;
+            if (g_lastRecoveryAttemptTick == 0 ||
+                static_cast<LONG>(now - g_lastRecoveryAttemptTick) >= static_cast<LONG>(kRecoveryOfflineProbeIntervalMs)) {
+                notifyClientToConnect(g_selectedClientIp, "recover");
+                g_lastRecoveryAttemptTick = now;
+            }
+            return;
+        }
+        if (g_recoveryTargetWasOffline) {
+            logTray(L"target client returned; sending recovery reconnect target=%ls", utf8ToWide(g_selectedClientIp).c_str());
+            notifyClientToConnect(g_selectedClientIp, "recover");
+            g_lastRecoveryAttemptTick = now;
+            g_recoveryTargetWasOffline = false;
+            showBalloon(window, L"Linux client returned", L"Reconnecting the extended display session.");
+        }
+        return;
+    }
+
+    if (!g_recoveryPending) {
+        return;
+    }
+    if (g_recoveryAttempts >= kMaxRecoveryAttempts) {
+        logTray(L"auto recovery gave up target=%ls attempts=%d", utf8ToWide(g_selectedClientIp).c_str(), g_recoveryAttempts);
+        resetRecoveryState();
+        g_recoveryArmed = false;
+        removeVirtualDisplayIfInstalled(window);
+        showBalloon(window, L"Extended display stopped", L"Automatic reconnect timed out. The virtual display was removed.");
+        return;
+    }
+    if (g_recoveryNotBeforeTick != 0 &&
+        static_cast<LONG>(now - g_recoveryNotBeforeTick) < 0) {
+        return;
+    }
+    if (g_lastRecoveryAttemptTick != 0 &&
+        static_cast<LONG>(now - g_lastRecoveryAttemptTick) < static_cast<LONG>(kRecoveryAttemptIntervalMs)) {
+        return;
+    }
+    if (!targetOnline && g_lastRecoveryAttemptTick != 0 &&
+        static_cast<LONG>(now - g_lastRecoveryAttemptTick) < static_cast<LONG>(kRecoveryOfflineProbeIntervalMs)) {
+        return;
+    }
+
+    ++g_recoveryAttempts;
+    g_lastRecoveryAttemptTick = now;
+    logTray(
+        L"auto recovery attempt %d target=%ls online=%ls",
+        g_recoveryAttempts,
+        utf8ToWide(g_selectedClientIp).c_str(),
+        targetOnline ? L"true" : L"false");
+    if (!createVirtualMonitor(window)) {
+        return;
+    }
+    g_virtualDisplayInstalled = true;
+    if (!startHost(window)) {
+        return;
+    }
+    notifyClientToConnect(g_selectedClientIp, "recover");
+    g_recoveryPending = false;
+    g_recoveryTargetWasOffline = false;
+    showBalloon(window, L"Extended display reconnecting", L"The host session was restarted and the Linux client was notified.");
+}
+
 void startExtendedDisplay(HWND window, const std::string& clientIp = {}) {
-    const std::string targetIp = clientIp.empty() ? g_selectedClientIp : clientIp;
+    const std::string targetIp = clientIp.empty() ? defaultTargetIp() : clientIp;
     logTray(L"start command received target=%ls", utf8ToWide(targetIp).c_str());
+    if (targetIp.empty()) {
+        sendDiscoveryProbe();
+        showBalloon(window, L"No Linux client selected", L"Refresh clients or use Start by IP before starting the extended display.");
+        logTray(L"start command cancelled because target is empty");
+        return;
+    }
     if (!targetIp.empty()) {
         g_selectedClientIp = targetIp;
+        rememberDevice(g_selectedClientIp, g_selectedClientIp, "selected");
+        saveTraySettings();
     }
+    resetRecoveryState();
+    g_recoveryArmed = false;
+    if (!g_selectedClientIp.empty()) {
+        g_recoveryArmAfterTick = GetTickCount() + 15000;
+    }
+    g_userStopping = false;
     showBalloon(window, L"Starting extended display", L"Preparing the virtual display and client connection.");
     if (!createVirtualMonitor(window)) {
         logTray(L"create virtual monitor failed");
+        g_recoveryArmed = false;
         return;
     }
     g_virtualDisplayInstalled = true;
     if (!startHost(window)) {
         logTray(L"start host failed; removing virtual monitor");
+        g_recoveryArmed = false;
         removeVirtualDisplayIfInstalled(window);
         return;
     }
@@ -918,9 +1111,13 @@ void startExtendedDisplay(HWND window, const std::string& clientIp = {}) {
 
 void stopExtendedDisplay(HWND window) {
     logTray(L"stop command received");
+    g_userStopping = true;
+    g_recoveryArmed = false;
+    resetRecoveryState();
     showBalloon(window, L"Stopping extended display", L"Stopping capture and removing the virtual display.");
     stopHost();
     removeVirtualDisplayIfInstalled(window);
+    g_userStopping = false;
     logTray(L"stop command completed");
     showBalloon(window, L"Extended display stopped", L"The virtual display removal was requested.");
 }
@@ -1153,7 +1350,14 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         requestDriverMonitorDestroy();
         return 0;
     case WM_TIMER:
+        if (wParam == kMonitorTimerId) {
+            pollRecovery(window);
+        }
         if (wParam == kMonitorTimerId && g_virtualDisplayInstalled && !g_sessionRestarting && !hostStillRunning()) {
+            if (g_recoveryArmed && !g_userStopping) {
+                beginRecovery(window, L"host timer detected process exit");
+                return 0;
+            }
             showBalloon(window, L"Extended display ended", L"Host stopped unexpectedly. Removing the virtual display.");
             removeVirtualDisplayIfInstalled(window);
             return 0;
@@ -1178,6 +1382,10 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         }
         hostStillRunning();
         if (g_virtualDisplayInstalled) {
+            if (g_recoveryArmed && !g_userStopping && !g_sessionRestarting) {
+                beginRecovery(window, L"host process exited");
+                return 0;
+            }
             showBalloon(window, L"Extended display ended", L"Host stopped. Removing the virtual display.");
             removeVirtualDisplayIfInstalled(window);
         } else {
@@ -1264,6 +1472,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_DESTROY:
         KillTimer(window, kMonitorTimerId);
         removeTrayIcon(window);
+        g_userStopping = true;
+        g_recoveryArmed = false;
+        resetRecoveryState();
         stopHost();
         removeVirtualDisplayIfInstalled(window);
         stopDiscovery();

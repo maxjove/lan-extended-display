@@ -20,7 +20,7 @@ The tray icon menu provides:
 - `Start discovered client`: starts a Linux client discovered on the LAN through UDP port `17659`
 - `Start by IP...`: sends a connect command to a manually entered Linux client IP, then starts the extended display
 - `Refresh clients`: broadcasts a discovery probe on UDP port `17659`
-- `Quality`: selects MJPEG quality: `Fast 45`, `Balanced 55`, or `Sharp 65`. The value is saved in `led_host_tray.ini`; if a display session is running, the tray restarts that session automatically so the new quality takes effect.
+- `Quality`: selects MJPEG quality: `Fast 55`, `Balanced 75`, `Sharp 85`, or `Ultra 90`. The value is saved in `led_host_tray.ini`; if a display session is running, the tray restarts that session automatically so the new quality takes effect.
 - `Stop extended display`: asks the running host to stop through `Local\LanExtendedDisplayHostStop`, then asks the IddCx driver to detach the virtual monitor without requiring administrator confirmation
 - `Install firewall rules`: asks for administrator permission and opens inbound TCP `17660` plus UDP `17659`, `17670`, and `17691` on private/domain networks
 - `Open log`: opens `led_host_tray.log`
@@ -44,7 +44,13 @@ Frame latency telemetry uses UDP `17692`. The host logs `receive_ack_*` and `ren
 Both are clock-safe because they use the Windows send timestamp and Windows receive timestamp around a Linux ACK.
 
 The virtual display is session-scoped: it should not be present before `Start extended display`.
-If no Linux client connects within 10 seconds, or if the host exits unexpectedly, the tray app removes the virtual display automatically.
+If no Linux client connects during an initial manual start, the tray app removes the virtual display automatically.
+After a session has been established for a selected Linux IP, the tray arms automatic recovery:
+
+- If the selected Linux client disappears from discovery, Windows keeps the tray session armed and periodically sends a lightweight recovery connect command.
+- If the client later reappears on the LAN, Windows sends a `LED_CONNECT_V1` command with `reason=recover`.
+- If `led_host_app.exe` exits because the control connection or frame ACKs were interrupted, the tray starts a recovery loop instead of immediately giving up. It recreates the virtual monitor, restarts the host process, and asks the Linux tray to reconnect.
+- Manual `Stop extended display` disables recovery and removes the virtual display immediately.
 
 ## Linux Tray
 

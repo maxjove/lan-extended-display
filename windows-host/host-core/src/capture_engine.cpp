@@ -26,7 +26,7 @@ namespace led::host {
 #if defined(_WIN32)
 namespace {
 
-constexpr auto kDxgiFallbackRetryInterval = std::chrono::milliseconds(500);
+constexpr auto kDxgiFallbackRetryInterval = std::chrono::milliseconds(100);
 
 std::string hresultText(HRESULT hr, const char* operation) {
     return std::string(operation) + " failed with HRESULT 0x" + std::to_string(static_cast<unsigned long>(hr));
@@ -36,6 +36,127 @@ void releaseCom(void*& pointer) {
     if (pointer != nullptr) {
         static_cast<IUnknown*>(pointer)->Release();
         pointer = nullptr;
+    }
+}
+
+std::uint32_t scaleCoordinate(std::uint32_t value, std::uint32_t sourceSize, std::uint32_t destinationSize, bool roundUp) {
+    if (sourceSize == 0 || destinationSize == 0) {
+        return 0;
+    }
+    const auto numerator = static_cast<std::uint64_t>(value) * destinationSize;
+    if (roundUp) {
+        return static_cast<std::uint32_t>((numerator + sourceSize - 1) / sourceSize);
+    }
+    return static_cast<std::uint32_t>(numerator / sourceSize);
+}
+
+void appendScaledDirtyRect(
+    CapturedFrame& frame,
+    LONG left,
+    LONG top,
+    LONG right,
+    LONG bottom,
+    std::uint32_t sourceWidth,
+    std::uint32_t sourceHeight) {
+    if (sourceWidth == 0 || sourceHeight == 0 || frame.width == 0 || frame.height == 0) {
+        return;
+    }
+
+    left = std::clamp<LONG>(left, 0, static_cast<LONG>(sourceWidth));
+    top = std::clamp<LONG>(top, 0, static_cast<LONG>(sourceHeight));
+    right = std::clamp<LONG>(right, 0, static_cast<LONG>(sourceWidth));
+    bottom = std::clamp<LONG>(bottom, 0, static_cast<LONG>(sourceHeight));
+    if (right <= left || bottom <= top) {
+        return;
+    }
+
+    const auto x = scaleCoordinate(static_cast<std::uint32_t>(left), sourceWidth, frame.width, false);
+    const auto y = scaleCoordinate(static_cast<std::uint32_t>(top), sourceHeight, frame.height, false);
+    const auto rightScaled = scaleCoordinate(static_cast<std::uint32_t>(right), sourceWidth, frame.width, true);
+    const auto bottomScaled = scaleCoordinate(static_cast<std::uint32_t>(bottom), sourceHeight, frame.height, true);
+    const auto clampedRight = std::min<std::uint32_t>(frame.width, std::max<std::uint32_t>(rightScaled, x + 1));
+    const auto clampedBottom = std::min<std::uint32_t>(frame.height, std::max<std::uint32_t>(bottomScaled, y + 1));
+    if (clampedRight <= x || clampedBottom <= y) {
+        return;
+    }
+
+    frame.dirtyRects.push_back(CaptureDirtyRect{x, y, clampedRight - x, clampedBottom - y});
+}
+
+void markFullFrameDirty(CapturedFrame& frame) {
+    frame.dirtyRectsKnown = true;
+    frame.dirtyRects.clear();
+    if (frame.width != 0 && frame.height != 0) {
+        frame.dirtyRects.push_back(CaptureDirtyRect{0, 0, frame.width, frame.height});
+    }
+}
+
+void populateDxgiDirtyRects(IDXGIOutputDuplication* duplication, CaptureEngine& engine, CapturedFrame& frame) {
+    frame.dirtyRectsKnown = true;
+    frame.dirtyRects.clear();
+
+    UINT moveBytesRequired = 0;
+    HRESULT hr = duplication->GetFrameMoveRects(0, nullptr, &moveBytesRequired);
+    if (hr == DXGI_ERROR_MORE_DATA && moveBytesRequired > 0) {
+        std::vector<DXGI_OUTDUPL_MOVE_RECT> moveRects(
+            moveBytesRequired / sizeof(DXGI_OUTDUPL_MOVE_RECT));
+        UINT moveBytes = moveBytesRequired;
+        hr = duplication->GetFrameMoveRects(moveBytes, moveRects.data(), &moveBytes);
+        if (SUCCEEDED(hr)) {
+            const auto count = moveBytes / sizeof(DXGI_OUTDUPL_MOVE_RECT);
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto& rect = moveRects[i];
+                appendScaledDirtyRect(
+                    frame,
+                    rect.DestinationRect.left,
+                    rect.DestinationRect.top,
+                    rect.DestinationRect.right,
+                    rect.DestinationRect.bottom,
+                    engine.sourceWidth_,
+                    engine.sourceHeight_);
+                const auto width = rect.DestinationRect.right - rect.DestinationRect.left;
+                const auto height = rect.DestinationRect.bottom - rect.DestinationRect.top;
+                appendScaledDirtyRect(
+                    frame,
+                    rect.SourcePoint.x,
+                    rect.SourcePoint.y,
+                    rect.SourcePoint.x + width,
+                    rect.SourcePoint.y + height,
+                    engine.sourceWidth_,
+                    engine.sourceHeight_);
+            }
+        } else {
+            frame.dirtyRectsKnown = false;
+        }
+    } else if (FAILED(hr) && hr != DXGI_ERROR_MORE_DATA) {
+        frame.dirtyRectsKnown = false;
+    }
+
+    UINT dirtyBytesRequired = 0;
+    hr = duplication->GetFrameDirtyRects(0, nullptr, &dirtyBytesRequired);
+    if (hr == DXGI_ERROR_MORE_DATA && dirtyBytesRequired > 0) {
+        std::vector<RECT> dirtyRects(dirtyBytesRequired / sizeof(RECT));
+        UINT dirtyBytes = dirtyBytesRequired;
+        hr = duplication->GetFrameDirtyRects(dirtyBytes, dirtyRects.data(), &dirtyBytes);
+        if (SUCCEEDED(hr)) {
+            const auto count = dirtyBytes / sizeof(RECT);
+            for (std::size_t i = 0; i < count; ++i) {
+                appendScaledDirtyRect(
+                    frame,
+                    dirtyRects[i].left,
+                    dirtyRects[i].top,
+                    dirtyRects[i].right,
+                    dirtyRects[i].bottom,
+                    engine.sourceWidth_,
+                    engine.sourceHeight_);
+            }
+        } else {
+            frame.dirtyRectsKnown = false;
+            frame.dirtyRects.clear();
+        }
+    } else if (FAILED(hr) && hr != DXGI_ERROR_MORE_DATA) {
+        frame.dirtyRectsKnown = false;
+        frame.dirtyRects.clear();
     }
 }
 
@@ -365,6 +486,8 @@ Status captureGdiFrame(CaptureEngine& engine, CapturedFrame& frame) {
     const auto byteCount = static_cast<std::size_t>(frame.width) * frame.height * 4;
     frame.bgra.resize(byteCount);
     std::memcpy(frame.bgra.data(), engine.bitmapBits_, byteCount);
+    frame.dirtyRectsKnown = false;
+    frame.dirtyRects.clear();
     engine.capturedRealFrame_ = true;
     return Status::ok();
 }
@@ -411,6 +534,8 @@ Status captureDxgiFrame(CaptureEngine& engine, CapturedFrame& frame) {
             return captureGdiFrame(engine, frame);
         }
         frame = engine.latestFrame_;
+        frame.dirtyRectsKnown = true;
+        frame.dirtyRects.clear();
         return Status::ok();
     }
     if (hr == DXGI_ERROR_ACCESS_LOST) {
@@ -427,6 +552,8 @@ Status captureDxgiFrame(CaptureEngine& engine, CapturedFrame& frame) {
         duplication->ReleaseFrame();
         return Status::unavailable(hresultText(hr, "QueryInterface(ID3D11Texture2D)"));
     }
+
+    populateDxgiDirtyRects(duplication, engine, frame);
 
     context->CopyResource(stagingTexture, desktopTexture.Get());
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -538,6 +665,7 @@ Status CaptureEngine::captureNextFrame(CapturedFrame& frame) {
             if (restartStatus.isOk()) {
                 status = captureDxgiFrame(*this, latestFrame_);
                 if (status.isOk()) {
+                    markFullFrameDirty(latestFrame_);
                     frame = latestFrame_;
                     return Status::ok();
                 }
@@ -567,6 +695,7 @@ Status CaptureEngine::captureNextFrame(CapturedFrame& frame) {
         if (retryStatus.isOk()) {
             auto status = captureDxgiFrame(*this, latestFrame_);
             if (status.isOk()) {
+                markFullFrameDirty(latestFrame_);
                 frame = latestFrame_;
                 return Status::ok();
             }

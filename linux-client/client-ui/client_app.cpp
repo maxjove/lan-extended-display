@@ -29,6 +29,7 @@ extern "C" {
 #include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
+#include <deque>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -990,10 +991,10 @@ int runReceiveMjpegStreamMode(int argc, char** argv) {
 #if defined(LED_HAS_LIBJPEG)
     std::mutex latestFrameMutex;
     std::condition_variable latestFrameCv;
-    led::transport::ReassembledMjpegFrame latestFrame;
-    bool latestFrameAvailable = false;
+    std::deque<led::transport::ReassembledMjpegFrame> latestFrames;
     bool latestFrameStop = false;
     led::Status directDecodeStatus = led::Status::ok();
+    constexpr std::size_t kMaxQueuedMjpegFrames = 32;
     std::thread directDecodeThread([&]() {
         std::vector<std::uint8_t> pixels;
         bool receivedKeyFrame = false;
@@ -1001,12 +1002,12 @@ int runReceiveMjpegStreamMode(int argc, char** argv) {
             led::transport::ReassembledMjpegFrame frameToDecode;
             {
                 std::unique_lock<std::mutex> lock(latestFrameMutex);
-                latestFrameCv.wait(lock, [&]() { return latestFrameStop || latestFrameAvailable; });
-                if (latestFrameStop && !latestFrameAvailable) {
+                latestFrameCv.wait(lock, [&]() { return latestFrameStop || !latestFrames.empty(); });
+                if (latestFrameStop && latestFrames.empty()) {
                     break;
                 }
-                frameToDecode = std::move(latestFrame);
-                latestFrameAvailable = false;
+                frameToDecode = std::move(latestFrames.front());
+                latestFrames.pop_front();
             }
             const auto canvasWidth = frameToDecode.canvasWidth != 0
                 ? frameToDecode.canvasWidth
@@ -1117,11 +1118,11 @@ int runReceiveMjpegStreamMode(int argc, char** argv) {
 #if defined(LED_HAS_LIBJPEG)
         {
             std::lock_guard<std::mutex> lock(latestFrameMutex);
-            if (latestFrameAvailable) {
+            if (latestFrames.size() >= kMaxQueuedMjpegFrames) {
+                latestFrames.pop_front();
                 ++decodeDropped;
             }
-            latestFrame = std::move(frame);
-            latestFrameAvailable = true;
+            latestFrames.push_back(std::move(frame));
         }
         latestFrameCv.notify_one();
 #else
@@ -1165,7 +1166,6 @@ int runReceiveMjpegStreamMode(int argc, char** argv) {
 #if defined(LED_HAS_LIBJPEG)
     {
         std::lock_guard<std::mutex> lock(latestFrameMutex);
-        latestFrameAvailable = false;
         latestFrameStop = true;
     }
     latestFrameCv.notify_one();
