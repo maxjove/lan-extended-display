@@ -273,6 +273,7 @@ struct MjpegLiveStats {
     std::atomic_uint64_t packetizeUs{0};
     std::atomic_uint64_t sendUs{0};
     std::atomic_uint64_t encodedRects{0};
+    std::atomic_uint64_t qualityBoostedRects{0};
 };
 
 struct MjpegLiveSnapshot {
@@ -290,6 +291,7 @@ struct MjpegLiveSnapshot {
     std::uint64_t packetizeUs{0};
     std::uint64_t sendUs{0};
     std::uint64_t encodedRects{0};
+    std::uint64_t qualityBoostedRects{0};
     std::uint32_t capturedFrames{0};
 };
 
@@ -309,6 +311,7 @@ MjpegLiveSnapshot snapshotMjpegLiveStats(const MjpegLiveStats& stats, std::uint3
         stats.packetizeUs.load(std::memory_order_relaxed),
         stats.sendUs.load(std::memory_order_relaxed),
         stats.encodedRects.load(std::memory_order_relaxed),
+        stats.qualityBoostedRects.load(std::memory_order_relaxed),
         capturedFrames,
     };
 }
@@ -341,6 +344,37 @@ std::uint64_t elapsedUsSince(std::chrono::steady_clock::time_point start) {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - start).count());
+}
+
+float selectJpegQualityForDirtyRect(
+    const DirtyRect& dirty,
+    std::uint32_t frameWidth,
+    std::uint32_t frameHeight,
+    float baseQuality,
+    float idleRefreshQuality,
+    bool idleRefresh,
+    bool& boosted) {
+    boosted = false;
+    if (idleRefresh) {
+        return idleRefreshQuality;
+    }
+    if (dirty.empty || dirty.fullFrame || frameWidth == 0 || frameHeight == 0) {
+        return baseQuality;
+    }
+
+    const auto fullArea = static_cast<double>(frameWidth) * static_cast<double>(frameHeight);
+    if (fullArea <= 0.0) {
+        return baseQuality;
+    }
+    const auto dirtyRatio = static_cast<double>(dirtyRectArea(dirty)) / fullArea;
+    float selected = baseQuality;
+    if (dirtyRatio <= 0.03) {
+        selected = std::max(selected, 0.96F);
+    } else if (dirtyRatio <= 0.15) {
+        selected = std::max(selected, 0.92F);
+    }
+    boosted = selected > baseQuality;
+    return selected;
 }
 
 DirtyRect unionDirtyRects(const DirtyRect& a, const DirtyRect& b) {
@@ -1483,6 +1517,15 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                     continue;
                 }
 
+                bool qualityBoosted = false;
+                const auto rectQuality = selectJpegQualityForDirtyRect(
+                    dirty,
+                    task.frame.width,
+                    task.frame.height,
+                    quality,
+                    idleRefreshQuality,
+                    task.idleRefresh,
+                    qualityBoosted);
                 const auto encodeStart = std::chrono::steady_clock::now();
                 auto encodeStatus = led::host::encodeBgraJpegRect(
                     task.frame,
@@ -1490,7 +1533,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                     dirty.y,
                     dirty.width,
                     dirty.height,
-                    task.idleRefresh ? idleRefreshQuality : quality,
+                    rectQuality,
                     jpeg);
                 liveStats.encodeUs.fetch_add(elapsedUsSince(encodeStart), std::memory_order_relaxed);
                 if (!encodeStatus.isOk()) {
@@ -1544,6 +1587,9 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                 frameHasFullRect = frameHasFullRect || dirty.fullFrame;
                 liveStats.dirtyRectsSent.fetch_add(1, std::memory_order_relaxed);
                 liveStats.encodedRects.fetch_add(1, std::memory_order_relaxed);
+                if (qualityBoosted) {
+                    liveStats.qualityBoostedRects.fetch_add(1, std::memory_order_relaxed);
+                }
             }
 
             if (frameEncodedBytes == 0) {
@@ -1697,6 +1743,8 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             const auto windowEncodedRects = delta(snapshot.encodedRects, previousLiveSnapshot.encodedRects);
             const auto windowEncodedBytes = delta(snapshot.encodedBytes, previousLiveSnapshot.encodedBytes);
             const auto windowDirtyAreaPixels = delta(snapshot.dirtyAreaPixels, previousLiveSnapshot.dirtyAreaPixels);
+            const auto windowQualityBoostedRects =
+                delta(snapshot.qualityBoostedRects, previousLiveSnapshot.qualityBoostedRects);
             const auto fullFrames = liveStats.fullFrames.load(std::memory_order_relaxed);
             const auto dirtyFrames = liveStats.dirtyFrames.load(std::memory_order_relaxed);
             const auto idleRefreshFrames = liveStats.idleRefreshFrames.load(std::memory_order_relaxed);
@@ -1725,6 +1773,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                       << " native_dirty=" << nativeDirtyFrames
                       << " tile_diff=" << tileDiffFrames
                       << " dirty_rects_sent=" << dirtyRectsSent
+                      << " quality_boosted=" << snapshot.qualityBoostedRects
                       << " encode_dropped=" << encodeTasksDropped
                       << " send_failures=" << sendFailures
                       << " avg_capture_ms=" << (capturedFrames == 0 ? 0.0 : (static_cast<double>(captureUs) / 1000.0 / capturedFrames))
@@ -1734,6 +1783,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                       << " avg_send_ms=" << (encodedRects == 0 ? 0.0 : (static_cast<double>(sendUs) / 1000.0 / encodedRects))
                       << " win_frame_delta=" << windowFrames
                       << " win_encoded_kb=" << (windowEncodedBytes / 1024)
+                      << " win_quality_boosted=" << windowQualityBoostedRects
                       << " win_encode_dropped=" << delta(snapshot.encodeTasksDropped, previousLiveSnapshot.encodeTasksDropped)
                       << " win_capture_ms=" << (windowFrames == 0 ? 0.0 :
                           (static_cast<double>(delta(snapshot.captureUs, previousLiveSnapshot.captureUs)) / 1000.0 / windowFrames))
@@ -1813,6 +1863,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     const auto packetizeUs = liveStats.packetizeUs.load(std::memory_order_relaxed);
     const auto sendUs = liveStats.sendUs.load(std::memory_order_relaxed);
     const auto encodedRects = liveStats.encodedRects.load(std::memory_order_relaxed);
+    const auto qualityBoostedRects = liveStats.qualityBoostedRects.load(std::memory_order_relaxed);
     std::cout << "Client ready: " << hello.device.name
               << " peer=" << target.address << ':' << target.port << '\n';
     std::cout << "Served MJPEG capture frames=" << capturedFrames
@@ -1824,6 +1875,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
               << " idle_refresh=" << idleRefreshFrames
               << " skipped=" << skippedFrames
               << " dirty_rects_sent=" << dirtyRectsSent
+              << " quality_boosted=" << qualityBoostedRects
               << " send_failures=" << sendFailures
               << " packets=" << packetsSent
               << " encoded_bytes=" << encodedBytes
