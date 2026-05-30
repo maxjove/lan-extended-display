@@ -23,6 +23,24 @@ namespace led::host {
 #if defined(LED_HAS_TURBOJPEG)
 namespace {
 
+class TurboJpegCompressor {
+public:
+    TurboJpegCompressor() : handle_(tjInitCompress()) {}
+    ~TurboJpegCompressor() {
+        if (handle_ != nullptr) {
+            tjDestroy(handle_);
+        }
+    }
+
+    TurboJpegCompressor(const TurboJpegCompressor&) = delete;
+    TurboJpegCompressor& operator=(const TurboJpegCompressor&) = delete;
+
+    [[nodiscard]] tjhandle get() const { return handle_; }
+
+private:
+    tjhandle handle_{nullptr};
+};
+
 Status encodeBgraJpegRectTurbo(
     const CapturedFrame& frame,
     std::uint32_t x,
@@ -31,7 +49,8 @@ Status encodeBgraJpegRectTurbo(
     std::uint32_t height,
     float quality,
     EncodedJpegFrame& encoded) {
-    tjhandle handle = tjInitCompress();
+    thread_local TurboJpegCompressor compressor;
+    tjhandle handle = compressor.get();
     if (handle == nullptr) {
         return Status::unavailable("TurboJPEG compressor initialization failed");
     }
@@ -39,11 +58,10 @@ Status encodeBgraJpegRectTurbo(
     const auto qualityPercent = static_cast<int>(std::clamp(quality, 0.1F, 1.0F) * 100.0F);
     const auto maxBytes = tjBufSize(static_cast<int>(width), static_cast<int>(height), TJSAMP_444);
     if (maxBytes == 0) {
-        tjDestroy(handle);
         return Status::unavailable("TurboJPEG buffer sizing failed");
     }
 
-    encoded.jpegBytes.assign(maxBytes, 0);
+    encoded.jpegBytes.resize(maxBytes);
     auto* jpegBuffer = encoded.jpegBytes.data();
     unsigned long jpegBytes = static_cast<unsigned long>(encoded.jpegBytes.size());
     const auto* source = frame.bgra.data() + (static_cast<std::size_t>(y) * frame.width + x) * 4;
@@ -61,11 +79,9 @@ Status encodeBgraJpegRectTurbo(
         TJFLAG_FASTDCT | TJFLAG_NOREALLOC);
     if (result != 0) {
         const std::string error = tjGetErrorStr2(handle) != nullptr ? tjGetErrorStr2(handle) : "unknown TurboJPEG error";
-        tjDestroy(handle);
         return Status::unavailable("TurboJPEG encode failed: " + error);
     }
 
-    tjDestroy(handle);
     encoded.jpegBytes.resize(static_cast<std::size_t>(jpegBytes));
     encoded.frameId = frame.frameId;
     encoded.timestampUs = frame.timestampUs;
@@ -276,7 +292,11 @@ Status encodeBgraJpegRect(
     std::uint32_t height,
     float quality,
     EncodedJpegFrame& encoded) {
-    encoded = {};
+    encoded.frameId = 0;
+    encoded.timestampUs = 0;
+    encoded.width = 0;
+    encoded.height = 0;
+    encoded.jpegBytes.clear();
     if (frame.bgra.empty() || frame.width == 0 || frame.height == 0 || width == 0 || height == 0) {
         return Status::invalidArgument("cannot JPEG encode an empty frame");
     }
