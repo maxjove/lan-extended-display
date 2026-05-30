@@ -261,6 +261,7 @@ struct MjpegLiveStats {
     std::atomic_uint64_t fullFrames{0};
     std::atomic_uint64_t skippedFrames{0};
     std::atomic_uint64_t idleDiffSkippedFrames{0};
+    std::atomic_uint64_t idleCaptureSkippedFrames{0};
     std::atomic_uint64_t nativeDirtyFrames{0};
     std::atomic_uint64_t tileDiffFrames{0};
     std::atomic_uint64_t dirtyRectsSent{0};
@@ -282,6 +283,7 @@ struct MjpegLiveSnapshot {
     std::uint64_t fullFrames{0};
     std::uint64_t dirtyFrames{0};
     std::uint64_t skippedFrames{0};
+    std::uint64_t idleCaptureSkippedFrames{0};
     std::uint64_t dirtyRectsSent{0};
     std::uint64_t dirtyAreaPixels{0};
     std::uint64_t encodeTasksDropped{0};
@@ -302,6 +304,7 @@ MjpegLiveSnapshot snapshotMjpegLiveStats(const MjpegLiveStats& stats, std::uint3
         stats.fullFrames.load(std::memory_order_relaxed),
         stats.dirtyFrames.load(std::memory_order_relaxed),
         stats.skippedFrames.load(std::memory_order_relaxed),
+        stats.idleCaptureSkippedFrames.load(std::memory_order_relaxed),
         stats.dirtyRectsSent.load(std::memory_order_relaxed),
         stats.dirtyAreaPixels.load(std::memory_order_relaxed),
         stats.encodeTasksDropped.load(std::memory_order_relaxed),
@@ -1455,9 +1458,13 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     const auto idleKeyFrameInterval = std::max<std::uint32_t>(1, actualFps * 8);
     const auto idleDiffWarmupFrames = std::max<std::uint32_t>(1, actualFps / 3);
     const auto idleDiffProbeInterval = std::max<std::uint32_t>(1, actualFps / 15);
+    const auto idleCaptureProbeFps = std::min<std::uint32_t>(actualFps, 20);
+    const auto idleCaptureProbeInterval =
+        std::chrono::microseconds(1000000 / std::max<std::uint32_t>(1, idleCaptureProbeFps));
     const auto encodeSubmitFps = std::min<std::uint32_t>(actualFps, 30);
     const auto encodeSubmitInterval = std::chrono::microseconds(1000000 / std::max<std::uint32_t>(1, encodeSubmitFps));
     auto nextEncodeSubmitTime = std::chrono::steady_clock::now();
+    auto nextIdleCaptureProbeTime = std::chrono::steady_clock::now();
     std::uint32_t idleFrames = 0;
     bool forceRecoveryFrame = false;
     auto recoverCapture = [&]() -> led::Status {
@@ -1631,6 +1638,21 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             previousFrame = {};
             forceRecoveryFrame = true;
             idleFrames = 0;
+            nextIdleCaptureProbeTime = std::chrono::steady_clock::now();
+        }
+
+        const auto preCaptureNow = std::chrono::steady_clock::now();
+        if (idleFrames >= idleDiffWarmupFrames && preCaptureNow < nextIdleCaptureProbeTime) {
+            ++idleFrames;
+            ++capturedFrames;
+            liveStats.skippedFrames.fetch_add(1, std::memory_order_relaxed);
+            liveStats.idleCaptureSkippedFrames.fetch_add(1, std::memory_order_relaxed);
+            nextFrameTime += frameInterval;
+            std::this_thread::sleep_until(nextFrameTime);
+            continue;
+        }
+        if (idleFrames >= idleDiffWarmupFrames) {
+            nextIdleCaptureProbeTime = preCaptureNow + idleCaptureProbeInterval;
         }
 
         led::host::CapturedFrame frame;
@@ -1647,6 +1669,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             previousFrame = {};
             forceRecoveryFrame = true;
             idleFrames = 0;
+            nextIdleCaptureProbeTime = std::chrono::steady_clock::now();
             nextEncodeSubmitTime = std::chrono::steady_clock::now();
             nextFrameTime = std::chrono::steady_clock::now();
             continue;
@@ -1704,6 +1727,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             }
         } else {
             idleFrames = 0;
+            nextIdleCaptureProbeTime = std::chrono::steady_clock::now();
         }
         if (dirtyRects.empty() || (dirtyRects.size() == 1 && dirtyRects.front().empty)) {
             ++capturedFrames;
@@ -1750,6 +1774,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             const auto idleRefreshFrames = liveStats.idleRefreshFrames.load(std::memory_order_relaxed);
             const auto skippedFrames = liveStats.skippedFrames.load(std::memory_order_relaxed);
             const auto idleDiffSkippedFrames = liveStats.idleDiffSkippedFrames.load(std::memory_order_relaxed);
+            const auto idleCaptureSkippedFrames = liveStats.idleCaptureSkippedFrames.load(std::memory_order_relaxed);
             const auto nativeDirtyFrames = liveStats.nativeDirtyFrames.load(std::memory_order_relaxed);
             const auto tileDiffFrames = liveStats.tileDiffFrames.load(std::memory_order_relaxed);
             const auto dirtyRectsSent = liveStats.dirtyRectsSent.load(std::memory_order_relaxed);
@@ -1769,6 +1794,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                       << " dirty=" << dirtyFrames
                       << " idle_refresh=" << idleRefreshFrames
                       << " skipped=" << skippedFrames
+                      << " idle_capture_skipped=" << idleCaptureSkippedFrames
                       << " idle_diff_skipped=" << idleDiffSkippedFrames
                       << " native_dirty=" << nativeDirtyFrames
                       << " tile_diff=" << tileDiffFrames
@@ -1856,6 +1882,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     const auto fullFrames = liveStats.fullFrames.load(std::memory_order_relaxed);
     const auto idleRefreshFrames = liveStats.idleRefreshFrames.load(std::memory_order_relaxed);
     const auto skippedFrames = liveStats.skippedFrames.load(std::memory_order_relaxed);
+    const auto idleCaptureSkippedFrames = liveStats.idleCaptureSkippedFrames.load(std::memory_order_relaxed);
     const auto dirtyRectsSent = liveStats.dirtyRectsSent.load(std::memory_order_relaxed);
     const auto captureUs = liveStats.captureUs.load(std::memory_order_relaxed);
     const auto dirtyUs = liveStats.dirtyUs.load(std::memory_order_relaxed);
@@ -1874,6 +1901,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
               << " dirty=" << dirtyFrames
               << " idle_refresh=" << idleRefreshFrames
               << " skipped=" << skippedFrames
+              << " idle_capture_skipped=" << idleCaptureSkippedFrames
               << " dirty_rects_sent=" << dirtyRectsSent
               << " quality_boosted=" << qualityBoostedRects
               << " send_failures=" << sendFailures

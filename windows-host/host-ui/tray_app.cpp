@@ -34,6 +34,7 @@ constexpr int kMenuManualIp = 1004;
 constexpr int kMenuRefreshDevices = 1005;
 constexpr int kMenuOpenLog = 1006;
 constexpr int kMenuInstallFirewall = 1007;
+constexpr int kMenuDiagnostics = 1008;
 constexpr int kMenuQuality55 = 1010;
 constexpr int kMenuQuality75 = 1011;
 constexpr int kMenuQuality85 = 1012;
@@ -66,6 +67,8 @@ HANDLE g_activeMonitorEvent{nullptr};
 bool g_virtualDisplayInstalled{false};
 bool g_virtualDisplayRemoving{false};
 bool g_sessionRestarting{false};
+bool g_diagnosticsEnabled{false};
+bool g_orphanCleanupCompleted{false};
 bool g_userStopping{false};
 bool g_recoveryArmed{false};
 bool g_recoveryPending{false};
@@ -578,6 +581,11 @@ void loadTraySettings() {
         L"jpeg_quality",
         55,
         trayConfigPath().c_str()));
+    g_diagnosticsEnabled = GetPrivateProfileIntW(
+        L"diagnostics",
+        L"enabled",
+        0,
+        trayConfigPath().c_str()) != 0;
     wchar_t target[64]{};
     GetPrivateProfileStringW(
         L"client",
@@ -597,6 +605,11 @@ void saveTraySettings() {
     wchar_t value[16]{};
     swprintf_s(value, L"%d", normalizeJpegQuality(g_jpegQuality));
     WritePrivateProfileStringW(L"video", L"jpeg_quality", value, trayConfigPath().c_str());
+    WritePrivateProfileStringW(
+        L"diagnostics",
+        L"enabled",
+        g_diagnosticsEnabled ? L"1" : L"0",
+        trayConfigPath().c_str());
     if (isValidIpv4(g_selectedClientIp)) {
         WritePrivateProfileStringW(
             L"client",
@@ -777,13 +790,13 @@ bool destroyVirtualMonitor(HWND window) {
     return false;
 }
 
-void requestDriverMonitorDestroy() {
+bool requestDriverMonitorDestroy() {
     logTray(L"request driver monitor destroy");
     if (ensureActiveMonitorEvent()) {
         ResetEvent(g_activeMonitorEvent);
         logTray(L"active monitor event reset");
     }
-    signalDriverEvent(kDriverDestroyMonitorEventName);
+    return signalDriverEvent(kDriverDestroyMonitorEventName);
 }
 
 void removeVirtualDisplayIfInstalled(HWND window, bool removeDevice = false) {
@@ -877,8 +890,19 @@ bool startHost(HWND window) {
     startup.hStdError = g_hostStderr;
     startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
+    wchar_t previousDiagnostics[32]{};
+    const DWORD previousDiagnosticsLength = GetEnvironmentVariableW(
+        L"LED_HOST_DIAGNOSTICS",
+        previousDiagnostics,
+        ARRAYSIZE(previousDiagnostics));
+    if (g_diagnosticsEnabled) {
+        SetEnvironmentVariableW(L"LED_HOST_DIAGNOSTICS", L"1");
+    } else {
+        SetEnvironmentVariableW(L"LED_HOST_DIAGNOSTICS", nullptr);
+    }
+
     PROCESS_INFORMATION process{};
-    if (!CreateProcessW(
+    const BOOL created = CreateProcessW(
             nullptr,
             command.data(),
             nullptr,
@@ -888,7 +912,13 @@ bool startHost(HWND window) {
             nullptr,
             directory.c_str(),
             &startup,
-            &process)) {
+            &process);
+    if (previousDiagnosticsLength > 0 && previousDiagnosticsLength < ARRAYSIZE(previousDiagnostics)) {
+        SetEnvironmentVariableW(L"LED_HOST_DIAGNOSTICS", previousDiagnostics);
+    } else {
+        SetEnvironmentVariableW(L"LED_HOST_DIAGNOSTICS", nullptr);
+    }
+    if (!created) {
         if (g_hostStdout != nullptr) {
             CloseHandle(g_hostStdout);
         }
@@ -905,7 +935,11 @@ bool startHost(HWND window) {
     g_host.process = process;
     g_host.started = true;
     const auto hostGeneration = ++g_hostGeneration;
-    logTray(L"host process started pid=%lu jpeg_quality=%d", process.dwProcessId, normalizeJpegQuality(g_jpegQuality));
+    logTray(
+        L"host process started pid=%lu jpeg_quality=%d diagnostics=%ls",
+        process.dwProcessId,
+        normalizeJpegQuality(g_jpegQuality),
+        g_diagnosticsEnabled ? L"on" : L"off");
     if (WaitForSingleObject(g_host.process.hProcess, 1200) != WAIT_TIMEOUT) {
         DWORD exitCode = 1;
         GetExitCodeProcess(g_host.process.hProcess, &exitCode);
@@ -1150,6 +1184,36 @@ void setJpegQuality(HWND window, int quality) {
     logTray(L"quality restart completed");
 }
 
+void setDiagnosticsEnabled(HWND window, bool enabled) {
+    if (g_diagnosticsEnabled == enabled) {
+        return;
+    }
+    g_diagnosticsEnabled = enabled;
+    saveTraySettings();
+    const bool running = hostStillRunning() || g_virtualDisplayInstalled;
+    logTray(L"diagnostics set to %ls running=%ls", enabled ? L"on" : L"off", running ? L"true" : L"false");
+    if (!running) {
+        showBalloon(window, enabled ? L"Diagnostics enabled" : L"Diagnostics disabled", L"The setting will be used for the next start.");
+        return;
+    }
+
+    const std::string targetIp = g_selectedClientIp;
+    showBalloon(window, L"Applying diagnostics", L"Restarting capture without removing the virtual display.");
+    g_sessionRestarting = true;
+    ++g_hostGeneration;
+    stopHost();
+    Sleep(150);
+    const bool restarted = startHost(window);
+    g_sessionRestarting = false;
+    if (!restarted) {
+        logTray(L"diagnostics restart failed");
+        showBalloon(window, L"Diagnostics apply failed", L"Capture did not restart. Use Stop to remove the virtual display if needed.");
+        return;
+    }
+    notifyClientToConnect(targetIp);
+    logTray(L"diagnostics restart completed");
+}
+
 void addTrayIcon(HWND window) {
     NOTIFYICONDATAW data{};
     data.cbSize = sizeof(data);
@@ -1300,6 +1364,7 @@ void showTrayMenu(HWND window) {
     std::wstring status = busy ? L"Status: running" : L"Status: stopped";
     status += L"  Quality: ";
     status += std::to_wstring(normalizeJpegQuality(g_jpegQuality));
+    status += g_diagnosticsEnabled ? L"  Diagnostics: on" : L"  Diagnostics: off";
     if (!g_selectedClientIp.empty()) {
         status += L"  Target: ";
         status += utf8ToWide(g_selectedClientIp);
@@ -1327,6 +1392,7 @@ void showTrayMenu(HWND window) {
     AppendMenuW(qualityMenu, MF_STRING | (quality == 85 ? MF_CHECKED : 0), kMenuQuality85, L"Sharp 85");
     AppendMenuW(qualityMenu, MF_STRING | (quality == 90 ? MF_CHECKED : 0), kMenuQuality90, L"Ultra 90");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(qualityMenu), L"Quality");
+    AppendMenuW(menu, MF_STRING | (g_diagnosticsEnabled ? MF_CHECKED : 0), kMenuDiagnostics, L"Diagnostics");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (busy ? 0 : MF_GRAYED), kMenuStop, L"Stop extended display");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -1347,7 +1413,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         addTrayIcon(window);
         startDiscovery();
         SetTimer(window, kMonitorTimerId, 2000, nullptr);
-        requestDriverMonitorDestroy();
+        g_orphanCleanupCompleted = requestDriverMonitorDestroy();
         return 0;
     case WM_TIMER:
         if (wParam == kMonitorTimerId) {
@@ -1362,11 +1428,11 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             removeVirtualDisplayIfInstalled(window);
             return 0;
         }
-        if (wParam == kMonitorTimerId && !g_virtualDisplayInstalled && !hostStillRunning()) {
+        if (wParam == kMonitorTimerId && !g_orphanCleanupCompleted && !g_virtualDisplayInstalled && !hostStillRunning()) {
             static ULONGLONG lastOrphanCleanupTick = 0;
             const ULONGLONG now = GetTickCount64();
             if (lastOrphanCleanupTick == 0 || now - lastOrphanCleanupTick >= 15000) {
-                requestDriverMonitorDestroy();
+                g_orphanCleanupCompleted = requestDriverMonitorDestroy();
                 lastOrphanCleanupTick = now;
             }
             return 0;
@@ -1389,7 +1455,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             showBalloon(window, L"Extended display ended", L"Host stopped. Removing the virtual display.");
             removeVirtualDisplayIfInstalled(window);
         } else {
-            requestDriverMonitorDestroy();
+            g_orphanCleanupCompleted = requestDriverMonitorDestroy();
         }
         return 0;
     case WM_COMMAND:
@@ -1433,6 +1499,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             return 0;
         case kMenuQuality90:
             setJpegQuality(window, 90);
+            return 0;
+        case kMenuDiagnostics:
+            setDiagnosticsEnabled(window, !g_diagnosticsEnabled);
             return 0;
         case kMenuInstallFirewall:
             if (installFirewallRules(window)) {
