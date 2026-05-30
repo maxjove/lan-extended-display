@@ -47,6 +47,7 @@ constexpr DWORD kDeviceOnlineTimeoutMs = 15000;
 constexpr DWORD kRecoveryFirstAttemptDelayMs = 8000;
 constexpr DWORD kRecoveryAttemptIntervalMs = 15000;
 constexpr DWORD kRecoveryOfflineProbeIntervalMs = 30000;
+constexpr DWORD kHotRestartClientReconnectDelayMs = 2000;
 constexpr int kMaxRecoveryAttempts = 120;
 constexpr const wchar_t* kWindowClassName = L"LanExtendedDisplayTrayWindow";
 constexpr const wchar_t* kSingleInstanceMutexName = L"Local\\LanExtendedDisplayTraySingleInstance";
@@ -83,6 +84,8 @@ std::mutex g_devicesMutex;
 HICON g_trayIcon{nullptr};
 int g_jpegQuality = 55;
 std::uint64_t g_hostGeneration = 0;
+std::uint64_t g_expectedHostExitGeneration = 0;
+std::wstring g_expectedHostExitReason;
 HANDLE g_singleInstanceMutex{nullptr};
 
 struct ClientDevice {
@@ -834,6 +837,36 @@ bool hostStillRunning() {
     return false;
 }
 
+void markExpectedHostExit(const wchar_t* reason) {
+    if (!g_host.started || g_host.process.hProcess == nullptr) {
+        g_expectedHostExitGeneration = 0;
+        g_expectedHostExitReason.clear();
+        return;
+    }
+    g_expectedHostExitGeneration = g_hostGeneration;
+    g_expectedHostExitReason = reason != nullptr ? reason : L"expected";
+    logTray(
+        L"expected host exit marked reason=%ls generation=%llu",
+        g_expectedHostExitReason.c_str(),
+        static_cast<unsigned long long>(g_expectedHostExitGeneration));
+}
+
+bool consumeExpectedHostExit(std::uint64_t generation, const wchar_t* source) {
+    if (g_expectedHostExitGeneration == 0 || generation != g_expectedHostExitGeneration) {
+        return false;
+    }
+    logTray(
+        L"expected host exit observed source=%ls reason=%ls generation=%llu current=%llu",
+        source != nullptr ? source : L"unknown",
+        g_expectedHostExitReason.empty() ? L"expected" : g_expectedHostExitReason.c_str(),
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long long>(g_hostGeneration));
+    g_expectedHostExitGeneration = 0;
+    g_expectedHostExitReason.clear();
+    hostStillRunning();
+    return true;
+}
+
 void setStopEvent() {
     HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, kStopEventName);
     if (event != nullptr) {
@@ -936,8 +969,9 @@ bool startHost(HWND window) {
     g_host.started = true;
     const auto hostGeneration = ++g_hostGeneration;
     logTray(
-        L"host process started pid=%lu jpeg_quality=%d diagnostics=%ls",
+        L"host process started pid=%lu generation=%llu jpeg_quality=%d diagnostics=%ls",
         process.dwProcessId,
+        static_cast<unsigned long long>(hostGeneration),
         normalizeJpegQuality(g_jpegQuality),
         g_diagnosticsEnabled ? L"on" : L"off");
     if (WaitForSingleObject(g_host.process.hProcess, 1200) != WAIT_TIMEOUT) {
@@ -1149,6 +1183,7 @@ void stopExtendedDisplay(HWND window) {
     g_recoveryArmed = false;
     resetRecoveryState();
     showBalloon(window, L"Stopping extended display", L"Stopping capture and removing the virtual display.");
+    markExpectedHostExit(L"user-stop");
     stopHost();
     removeVirtualDisplayIfInstalled(window);
     g_userStopping = false;
@@ -1170,6 +1205,7 @@ void setJpegQuality(HWND window, int quality) {
     showBalloon(window, L"Applying quality", L"Restarting capture without removing the virtual display.");
     logTray(L"quality restart begin target=%ls", utf8ToWide(targetIp).c_str());
     g_sessionRestarting = true;
+    markExpectedHostExit(L"quality-restart");
     ++g_hostGeneration;
     stopHost();
     Sleep(150);
@@ -1180,6 +1216,8 @@ void setJpegQuality(HWND window, int quality) {
         showBalloon(window, L"Quality apply failed", L"Capture did not restart. Use Stop to remove the virtual display if needed.");
         return;
     }
+    logTray(L"quality restart waiting %lu ms before client reconnect", kHotRestartClientReconnectDelayMs);
+    Sleep(kHotRestartClientReconnectDelayMs);
     notifyClientToConnect(targetIp);
     logTray(L"quality restart completed");
 }
@@ -1200,6 +1238,7 @@ void setDiagnosticsEnabled(HWND window, bool enabled) {
     const std::string targetIp = g_selectedClientIp;
     showBalloon(window, L"Applying diagnostics", L"Restarting capture without removing the virtual display.");
     g_sessionRestarting = true;
+    markExpectedHostExit(L"diagnostics-restart");
     ++g_hostGeneration;
     stopHost();
     Sleep(150);
@@ -1210,6 +1249,8 @@ void setDiagnosticsEnabled(HWND window, bool enabled) {
         showBalloon(window, L"Diagnostics apply failed", L"Capture did not restart. Use Stop to remove the virtual display if needed.");
         return;
     }
+    logTray(L"diagnostics restart waiting %lu ms before client reconnect", kHotRestartClientReconnectDelayMs);
+    Sleep(kHotRestartClientReconnectDelayMs);
     notifyClientToConnect(targetIp);
     logTray(L"diagnostics restart completed");
 }
@@ -1420,6 +1461,10 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             pollRecovery(window);
         }
         if (wParam == kMonitorTimerId && g_virtualDisplayInstalled && !g_sessionRestarting && !hostStillRunning()) {
+            if (g_expectedHostExitGeneration != 0 && g_expectedHostExitGeneration == g_hostGeneration) {
+                consumeExpectedHostExit(g_hostGeneration, L"monitor-timer");
+                return 0;
+            }
             if (g_recoveryArmed && !g_userStopping) {
                 beginRecovery(window, L"host timer detected process exit");
                 return 0;
@@ -1439,6 +1484,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         }
         break;
     case kHostExitedMessage:
+        if (consumeExpectedHostExit(static_cast<std::uint64_t>(wParam), L"wait-thread")) {
+            return 0;
+        }
         if (static_cast<std::uint64_t>(wParam) != g_hostGeneration) {
             logTray(
                 L"ignored stale host exit message generation=%llu current=%llu",
@@ -1544,6 +1592,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         g_userStopping = true;
         g_recoveryArmed = false;
         resetRecoveryState();
+        markExpectedHostExit(L"tray-exit");
         stopHost();
         removeVirtualDisplayIfInstalled(window);
         stopDiscovery();
