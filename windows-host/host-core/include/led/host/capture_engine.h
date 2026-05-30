@@ -23,6 +23,9 @@ struct CapturedFrame {
     std::uint32_t width{0};
     std::uint32_t height{0};
     bool dirtyRectsKnown{false};
+    bool partialCopyUsed{false};
+    std::uint32_t captureDirtyRectCount{0};
+    std::uint64_t captureDirtyAreaPixels{0};
     std::vector<CaptureDirtyRect> dirtyRects;
     std::vector<std::uint8_t> bgra;
 };

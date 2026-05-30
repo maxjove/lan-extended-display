@@ -263,6 +263,10 @@ struct MjpegLiveStats {
     std::atomic_uint64_t idleDiffSkippedFrames{0};
     std::atomic_uint64_t idleCaptureSkippedFrames{0};
     std::atomic_uint64_t nativeDirtyFrames{0};
+    std::atomic_uint64_t partialCopyFrames{0};
+    std::atomic_uint64_t dxgiDirtyFrames{0};
+    std::atomic_uint64_t dxgiDirtyRects{0};
+    std::atomic_uint64_t dxgiDirtyAreaPixels{0};
     std::atomic_uint64_t tileDiffFrames{0};
     std::atomic_uint64_t dirtyRectsSent{0};
     std::atomic_uint64_t idleRefreshFrames{0};
@@ -284,6 +288,10 @@ struct MjpegLiveSnapshot {
     std::uint64_t dirtyFrames{0};
     std::uint64_t skippedFrames{0};
     std::uint64_t idleCaptureSkippedFrames{0};
+    std::uint64_t partialCopyFrames{0};
+    std::uint64_t dxgiDirtyFrames{0};
+    std::uint64_t dxgiDirtyRects{0};
+    std::uint64_t dxgiDirtyAreaPixels{0};
     std::uint64_t dirtyRectsSent{0};
     std::uint64_t dirtyAreaPixels{0};
     std::uint64_t encodeTasksDropped{0};
@@ -305,6 +313,10 @@ MjpegLiveSnapshot snapshotMjpegLiveStats(const MjpegLiveStats& stats, std::uint3
         stats.dirtyFrames.load(std::memory_order_relaxed),
         stats.skippedFrames.load(std::memory_order_relaxed),
         stats.idleCaptureSkippedFrames.load(std::memory_order_relaxed),
+        stats.partialCopyFrames.load(std::memory_order_relaxed),
+        stats.dxgiDirtyFrames.load(std::memory_order_relaxed),
+        stats.dxgiDirtyRects.load(std::memory_order_relaxed),
+        stats.dxgiDirtyAreaPixels.load(std::memory_order_relaxed),
         stats.dirtyRectsSent.load(std::memory_order_relaxed),
         stats.dirtyAreaPixels.load(std::memory_order_relaxed),
         stats.encodeTasksDropped.load(std::memory_order_relaxed),
@@ -428,6 +440,52 @@ DirtyRect dirtyRectFromBounds(
     return DirtyRect{minX, minY, width, height, false, false};
 }
 
+std::vector<DirtyRect> reduceDirtyRects(
+    std::vector<DirtyRect> rects,
+    std::uint32_t frameWidth,
+    std::uint32_t frameHeight,
+    double fullFrameAreaRatio) {
+    if (rects.empty()) {
+        return {};
+    }
+
+    while (rects.size() > kMaxDirtyRectsPerFrame) {
+        std::size_t bestA = 0;
+        std::size_t bestB = 1;
+        std::uint64_t bestPenalty = UINT64_MAX;
+        for (std::size_t a = 0; a < rects.size(); ++a) {
+            for (std::size_t b = a + 1; b < rects.size(); ++b) {
+                const auto merged = unionDirtyRects(rects[a], rects[b]);
+                const auto penalty = dirtyRectArea(merged) - dirtyRectArea(rects[a]) - dirtyRectArea(rects[b]);
+                if (penalty < bestPenalty) {
+                    bestPenalty = penalty;
+                    bestA = a;
+                    bestB = b;
+                }
+            }
+        }
+        rects[bestA] = unionDirtyRects(rects[bestA], rects[bestB]);
+        rects.erase(rects.begin() + static_cast<std::ptrdiff_t>(bestB));
+    }
+
+    DirtyRect unionRect{};
+    bool hasUnion = false;
+    std::uint64_t totalArea = 0;
+    for (const auto& rect : rects) {
+        unionRect = hasUnion ? unionDirtyRects(unionRect, rect) : rect;
+        hasUnion = true;
+        totalArea += dirtyRectArea(rect);
+    }
+    const auto fullArea = static_cast<double>(frameWidth) * static_cast<double>(frameHeight);
+    if (fullArea <= 0.0 || static_cast<double>(dirtyRectArea(unionRect)) / fullArea >= fullFrameAreaRatio) {
+        return {fullDirtyRect(frameWidth, frameHeight)};
+    }
+    if (rects.size() <= 1 || static_cast<double>(totalArea) >= static_cast<double>(dirtyRectArea(unionRect)) * 0.85) {
+        return {unionRect};
+    }
+    return rects;
+}
+
 std::vector<DirtyRect> computeNativeDirtyRects(
     const led::host::CapturedFrame& frame,
     std::uint32_t alignPixels,
@@ -482,64 +540,28 @@ std::vector<DirtyRect> computeNativeDirtyRects(
         return {};
     }
 
-    while (rects.size() > kMaxDirtyRectsPerFrame) {
-        std::size_t bestA = 0;
-        std::size_t bestB = 1;
-        std::uint64_t bestPenalty = UINT64_MAX;
-        for (std::size_t a = 0; a < rects.size(); ++a) {
-            for (std::size_t b = a + 1; b < rects.size(); ++b) {
-                const auto merged = unionDirtyRects(rects[a], rects[b]);
-                const auto penalty = dirtyRectArea(merged) - dirtyRectArea(rects[a]) - dirtyRectArea(rects[b]);
-                if (penalty < bestPenalty) {
-                    bestPenalty = penalty;
-                    bestA = a;
-                    bestB = b;
-                }
-            }
-        }
-        rects[bestA] = unionDirtyRects(rects[bestA], rects[bestB]);
-        rects.erase(rects.begin() + static_cast<std::ptrdiff_t>(bestB));
-    }
-
-    DirtyRect unionRect{};
-    bool hasUnion = false;
-    std::uint64_t totalArea = 0;
-    for (const auto& rect : rects) {
-        unionRect = hasUnion ? unionDirtyRects(unionRect, rect) : rect;
-        hasUnion = true;
-        totalArea += dirtyRectArea(rect);
-    }
-    const auto fullArea = static_cast<double>(frame.width) * static_cast<double>(frame.height);
-    if (fullArea <= 0.0 || static_cast<double>(dirtyRectArea(unionRect)) / fullArea >= fullFrameAreaRatio) {
-        return {fullDirtyRect(frame.width, frame.height)};
-    }
-    if (rects.size() <= 1 || static_cast<double>(totalArea) >= static_cast<double>(dirtyRectArea(unionRect)) * 0.85) {
-        return {unionRect};
-    }
-    return rects;
+    return reduceDirtyRects(std::move(rects), frame.width, frame.height, fullFrameAreaRatio);
 }
 
-DirtyRect computeDirtyRect(
+std::vector<DirtyRect> computeDirtyRects(
     const led::host::CapturedFrame& current,
     const led::host::CapturedFrame& previous,
     std::uint32_t alignPixels,
     double fullFrameAreaRatio) {
     if (current.bgra.empty() || current.width == 0 || current.height == 0) {
-        return DirtyRect{0, 0, 0, 0, true, true};
+        return {DirtyRect{0, 0, 0, 0, true, true}};
     }
     if (previous.bgra.size() != current.bgra.size() ||
         previous.width != current.width ||
         previous.height != current.height) {
-        return fullDirtyRect(current.width, current.height);
+        return {fullDirtyRect(current.width, current.height)};
     }
 
     constexpr std::uint32_t kTilePixels = 32;
     constexpr std::uint32_t kBytesPerPixel = 4;
-    std::uint32_t minX = current.width;
-    std::uint32_t minY = current.height;
-    std::uint32_t maxX = 0;
-    std::uint32_t maxY = 0;
-    bool changed = false;
+    const auto tileColumns = (current.width + kTilePixels - 1) / kTilePixels;
+    const auto tileRows = (current.height + kTilePixels - 1) / kTilePixels;
+    std::vector<std::uint8_t> changedTiles(static_cast<std::size_t>(tileColumns) * tileRows, 0);
 
     for (std::uint32_t tileY = 0; tileY < current.height; tileY += kTilePixels) {
         const auto tileBottom = std::min<std::uint32_t>(current.height, tileY + kTilePixels);
@@ -556,19 +578,86 @@ DirtyRect computeDirtyRect(
                 }
             }
             if (tileChanged) {
-                minX = std::min(minX, tileX);
-                minY = std::min(minY, tileY);
-                maxX = std::max(maxX, tileRight - 1);
-                maxY = std::max(maxY, tileBottom - 1);
-                changed = true;
+                const auto column = tileX / kTilePixels;
+                const auto row = tileY / kTilePixels;
+                changedTiles[static_cast<std::size_t>(row) * tileColumns + column] = 1;
             }
         }
     }
-    if (!changed) {
-        return DirtyRect{0, 0, 0, 0, false, true};
+
+    std::vector<std::uint8_t> visited(changedTiles.size(), 0);
+    std::vector<DirtyRect> rects;
+    std::vector<std::uint32_t> stack;
+    for (std::uint32_t row = 0; row < tileRows; ++row) {
+        for (std::uint32_t column = 0; column < tileColumns; ++column) {
+            const auto startIndex = static_cast<std::size_t>(row) * tileColumns + column;
+            if (!changedTiles[startIndex] || visited[startIndex]) {
+                continue;
+            }
+
+            std::uint32_t minTileX = column;
+            std::uint32_t minTileY = row;
+            std::uint32_t maxTileX = column;
+            std::uint32_t maxTileY = row;
+            visited[startIndex] = 1;
+            stack.clear();
+            stack.push_back(static_cast<std::uint32_t>(startIndex));
+            while (!stack.empty()) {
+                const auto index = stack.back();
+                stack.pop_back();
+                const auto currentRow = index / tileColumns;
+                const auto currentColumn = index % tileColumns;
+                minTileX = std::min(minTileX, currentColumn);
+                minTileY = std::min(minTileY, currentRow);
+                maxTileX = std::max(maxTileX, currentColumn);
+                maxTileY = std::max(maxTileY, currentRow);
+
+                const std::int32_t neighbors[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+                for (const auto& neighbor : neighbors) {
+                    const auto nextColumn = static_cast<std::int32_t>(currentColumn) + neighbor[0];
+                    const auto nextRow = static_cast<std::int32_t>(currentRow) + neighbor[1];
+                    if (nextColumn < 0 || nextRow < 0 ||
+                        nextColumn >= static_cast<std::int32_t>(tileColumns) ||
+                        nextRow >= static_cast<std::int32_t>(tileRows)) {
+                        continue;
+                    }
+                    const auto nextIndex =
+                        static_cast<std::size_t>(nextRow) * tileColumns + static_cast<std::uint32_t>(nextColumn);
+                    if (!changedTiles[nextIndex] || visited[nextIndex]) {
+                        continue;
+                    }
+                    visited[nextIndex] = 1;
+                    stack.push_back(static_cast<std::uint32_t>(nextIndex));
+                }
+            }
+
+            const auto minX = minTileX * kTilePixels;
+            const auto minY = minTileY * kTilePixels;
+            const auto maxX = std::min<std::uint32_t>(current.width - 1, (maxTileX + 1) * kTilePixels - 1);
+            const auto maxY = std::min<std::uint32_t>(current.height - 1, (maxTileY + 1) * kTilePixels - 1);
+            auto dirty = dirtyRectFromBounds(
+                current.width,
+                current.height,
+                minX,
+                minY,
+                maxX,
+                maxY,
+                alignPixels,
+                fullFrameAreaRatio);
+            if (dirty.fullFrame) {
+                return {fullDirtyRect(current.width, current.height)};
+            }
+            if (!dirty.empty) {
+                rects.push_back(dirty);
+            }
+        }
     }
 
-    return dirtyRectFromBounds(current.width, current.height, minX, minY, maxX, maxY, alignPixels, fullFrameAreaRatio);
+    if (rects.empty()) {
+        return {};
+    }
+
+    return reduceDirtyRects(std::move(rects), current.width, current.height, fullFrameAreaRatio);
 }
 
 struct MjpegEncodeTask {
@@ -1674,6 +1763,14 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             nextFrameTime = std::chrono::steady_clock::now();
             continue;
         }
+        if (frame.partialCopyUsed) {
+            liveStats.partialCopyFrames.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (frame.captureDirtyRectCount > 0) {
+            liveStats.dxgiDirtyFrames.fetch_add(1, std::memory_order_relaxed);
+            liveStats.dxgiDirtyRects.fetch_add(frame.captureDirtyRectCount, std::memory_order_relaxed);
+            liveStats.dxgiDirtyAreaPixels.fetch_add(frame.captureDirtyAreaPixels, std::memory_order_relaxed);
+        }
 
         const bool startupKeyFrameWindowActive = capturedFrames < startupKeyFrameWindow;
         const auto keyFrameInterval =
@@ -1702,14 +1799,13 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             ? std::vector<DirtyRect>{fullDirtyRect(frame.width, frame.height)}
             : (frame.dirtyRectsKnown
                 ? computeNativeDirtyRects(frame, 16, 0.70)
-                : std::vector<DirtyRect>{computeDirtyRect(frame, previousFrame, 16, 0.70)});
+                : computeDirtyRects(frame, previousFrame, 16, 0.70));
         liveStats.dirtyUs.fetch_add(elapsedUsSince(dirtyStart), std::memory_order_relaxed);
         if (!forceKeyFrame && frame.dirtyRectsKnown) {
             liveStats.nativeDirtyFrames.fetch_add(1, std::memory_order_relaxed);
         } else if (!forceKeyFrame) {
             liveStats.tileDiffFrames.fetch_add(1, std::memory_order_relaxed);
         }
-        previousFrame = frame;
         bool idleRefresh = false;
         if (dirtyRects.empty() || (dirtyRects.size() == 1 && dirtyRects.front().empty)) {
             ++idleFrames;
@@ -1753,6 +1849,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             if (pendingEncodeTask.has_value()) {
                 liveStats.encodeTasksDropped.fetch_add(1, std::memory_order_relaxed);
             }
+            previousFrame = frame;
             pendingEncodeTask = MjpegEncodeTask{std::move(frame), std::move(dirtyRects), idleRefresh};
         }
         encodeCv.notify_one();
@@ -1767,6 +1864,8 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             const auto windowEncodedRects = delta(snapshot.encodedRects, previousLiveSnapshot.encodedRects);
             const auto windowEncodedBytes = delta(snapshot.encodedBytes, previousLiveSnapshot.encodedBytes);
             const auto windowDirtyAreaPixels = delta(snapshot.dirtyAreaPixels, previousLiveSnapshot.dirtyAreaPixels);
+            const auto windowDxgiDirtyAreaPixels =
+                delta(snapshot.dxgiDirtyAreaPixels, previousLiveSnapshot.dxgiDirtyAreaPixels);
             const auto windowQualityBoostedRects =
                 delta(snapshot.qualityBoostedRects, previousLiveSnapshot.qualityBoostedRects);
             const auto fullFrames = liveStats.fullFrames.load(std::memory_order_relaxed);
@@ -1776,6 +1875,9 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             const auto idleDiffSkippedFrames = liveStats.idleDiffSkippedFrames.load(std::memory_order_relaxed);
             const auto idleCaptureSkippedFrames = liveStats.idleCaptureSkippedFrames.load(std::memory_order_relaxed);
             const auto nativeDirtyFrames = liveStats.nativeDirtyFrames.load(std::memory_order_relaxed);
+            const auto partialCopyFrames = liveStats.partialCopyFrames.load(std::memory_order_relaxed);
+            const auto dxgiDirtyFrames = liveStats.dxgiDirtyFrames.load(std::memory_order_relaxed);
+            const auto dxgiDirtyRects = liveStats.dxgiDirtyRects.load(std::memory_order_relaxed);
             const auto tileDiffFrames = liveStats.tileDiffFrames.load(std::memory_order_relaxed);
             const auto dirtyRectsSent = liveStats.dirtyRectsSent.load(std::memory_order_relaxed);
             const auto sendFailures = liveStats.sendFailures.load(std::memory_order_relaxed);
@@ -1797,6 +1899,9 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                       << " idle_capture_skipped=" << idleCaptureSkippedFrames
                       << " idle_diff_skipped=" << idleDiffSkippedFrames
                       << " native_dirty=" << nativeDirtyFrames
+                      << " partial_copy=" << partialCopyFrames
+                      << " dxgi_dirty_frames=" << dxgiDirtyFrames
+                      << " dxgi_dirty_rects=" << dxgiDirtyRects
                       << " tile_diff=" << tileDiffFrames
                       << " dirty_rects_sent=" << dirtyRectsSent
                       << " quality_boosted=" << snapshot.qualityBoostedRects
@@ -1811,6 +1916,11 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                       << " win_encoded_kb=" << (windowEncodedBytes / 1024)
                       << " win_quality_boosted=" << windowQualityBoostedRects
                       << " win_encode_dropped=" << delta(snapshot.encodeTasksDropped, previousLiveSnapshot.encodeTasksDropped)
+                      << " win_partial_copy=" << delta(snapshot.partialCopyFrames, previousLiveSnapshot.partialCopyFrames)
+                      << " win_dxgi_dirty=" << delta(snapshot.dxgiDirtyFrames, previousLiveSnapshot.dxgiDirtyFrames)
+                      << " win_dxgi_dirty_pct=" << (windowFrames == 0 ? 0.0 :
+                          (static_cast<double>(windowDxgiDirtyAreaPixels) * 100.0 /
+                           (static_cast<double>(windowFrames) * mode.resolution.width * mode.resolution.height)))
                       << " win_capture_ms=" << (windowFrames == 0 ? 0.0 :
                           (static_cast<double>(delta(snapshot.captureUs, previousLiveSnapshot.captureUs)) / 1000.0 / windowFrames))
                       << " win_dirty_ms=" << (windowFrames == 0 ? 0.0 :
@@ -1862,11 +1972,8 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
       stopInputThread();
       displayManager.destroyVirtualDisplay();
       displayManager.restoreDisplayLayout();
-      if (keepMonitorOnExit && stopEvent.requested() && status.isOk()) {
-          driverMonitor.disarm();
-      } else {
-          driverMonitor.release();
-      }
+      (void)keepMonitorOnExit;
+      driverMonitor.release();
       if (status.isOk() && !inputStatus.isOk()) {
           status = inputStatus;
       }
@@ -1883,6 +1990,9 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     const auto idleRefreshFrames = liveStats.idleRefreshFrames.load(std::memory_order_relaxed);
     const auto skippedFrames = liveStats.skippedFrames.load(std::memory_order_relaxed);
     const auto idleCaptureSkippedFrames = liveStats.idleCaptureSkippedFrames.load(std::memory_order_relaxed);
+    const auto partialCopyFrames = liveStats.partialCopyFrames.load(std::memory_order_relaxed);
+    const auto dxgiDirtyFrames = liveStats.dxgiDirtyFrames.load(std::memory_order_relaxed);
+    const auto dxgiDirtyRects = liveStats.dxgiDirtyRects.load(std::memory_order_relaxed);
     const auto dirtyRectsSent = liveStats.dirtyRectsSent.load(std::memory_order_relaxed);
     const auto captureUs = liveStats.captureUs.load(std::memory_order_relaxed);
     const auto dirtyUs = liveStats.dirtyUs.load(std::memory_order_relaxed);
@@ -1902,6 +2012,9 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
               << " idle_refresh=" << idleRefreshFrames
               << " skipped=" << skippedFrames
               << " idle_capture_skipped=" << idleCaptureSkippedFrames
+              << " partial_copy=" << partialCopyFrames
+              << " dxgi_dirty_frames=" << dxgiDirtyFrames
+              << " dxgi_dirty_rects=" << dxgiDirtyRects
               << " dirty_rects_sent=" << dirtyRectsSent
               << " quality_boosted=" << qualityBoostedRects
               << " send_failures=" << sendFailures

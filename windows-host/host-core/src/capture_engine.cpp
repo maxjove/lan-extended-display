@@ -83,16 +83,36 @@ void appendScaledDirtyRect(
     frame.dirtyRects.push_back(CaptureDirtyRect{x, y, clampedRight - x, clampedBottom - y});
 }
 
+void refreshCaptureDirtyStats(CapturedFrame& frame) {
+    frame.captureDirtyRectCount = 0;
+    frame.captureDirtyAreaPixels = 0;
+    for (const auto& rect : frame.dirtyRects) {
+        const auto right = std::min<std::uint32_t>(frame.width, rect.x + rect.width);
+        const auto bottom = std::min<std::uint32_t>(frame.height, rect.y + rect.height);
+        if (right <= rect.x || bottom <= rect.y) {
+            continue;
+        }
+        ++frame.captureDirtyRectCount;
+        frame.captureDirtyAreaPixels +=
+            static_cast<std::uint64_t>(right - rect.x) * static_cast<std::uint64_t>(bottom - rect.y);
+    }
+}
+
 void markFullFrameDirty(CapturedFrame& frame) {
     frame.dirtyRectsKnown = true;
+    frame.partialCopyUsed = false;
     frame.dirtyRects.clear();
     if (frame.width != 0 && frame.height != 0) {
         frame.dirtyRects.push_back(CaptureDirtyRect{0, 0, frame.width, frame.height});
     }
+    refreshCaptureDirtyStats(frame);
 }
 
 void populateDxgiDirtyRects(IDXGIOutputDuplication* duplication, CaptureEngine& engine, CapturedFrame& frame) {
     frame.dirtyRectsKnown = true;
+    frame.partialCopyUsed = false;
+    frame.captureDirtyRectCount = 0;
+    frame.captureDirtyAreaPixels = 0;
     frame.dirtyRects.clear();
 
     UINT moveBytesRequired = 0;
@@ -158,6 +178,7 @@ void populateDxgiDirtyRects(IDXGIOutputDuplication* duplication, CaptureEngine& 
         frame.dirtyRectsKnown = false;
         frame.dirtyRects.clear();
     }
+    refreshCaptureDirtyStats(frame);
 }
 
 void scaleBgra(
@@ -197,6 +218,98 @@ void scaleBgra(
                         4);
         }
     }
+}
+
+std::uint64_t captureDirtyRectArea(const CaptureDirtyRect& rect) {
+    return static_cast<std::uint64_t>(rect.width) * rect.height;
+}
+
+bool shouldUsePartialDxgiCopy(const CaptureEngine& engine, const CapturedFrame& frame) {
+    if (!engine.capturedRealFrame_ || !frame.dirtyRectsKnown || frame.dirtyRects.empty()) {
+        return false;
+    }
+    if (engine.sourceWidth_ != frame.width || engine.sourceHeight_ != frame.height) {
+        return false;
+    }
+    if (frame.bgra.size() != static_cast<std::size_t>(frame.width) * frame.height * 4) {
+        return false;
+    }
+    if (frame.dirtyRects.size() > 32) {
+        return false;
+    }
+
+    std::uint64_t totalArea = 0;
+    for (const auto& rect : frame.dirtyRects) {
+        if (rect.width == 0 || rect.height == 0 || rect.x >= frame.width || rect.y >= frame.height) {
+            continue;
+        }
+        if (rect.x == 0 && rect.y == 0 && rect.width >= frame.width && rect.height >= frame.height) {
+            return false;
+        }
+        totalArea += captureDirtyRectArea(rect);
+    }
+    const auto fullArea = static_cast<std::uint64_t>(frame.width) * frame.height;
+    return fullArea != 0 && totalArea != 0 && totalArea * 100 <= fullArea * 35;
+}
+
+Status copyPartialDxgiFrame(
+    ID3D11DeviceContext* context,
+    ID3D11Texture2D* stagingTexture,
+    ID3D11Texture2D* desktopTexture,
+    CapturedFrame& frame) {
+    for (const auto& rect : frame.dirtyRects) {
+        const auto right = std::min<std::uint32_t>(frame.width, rect.x + rect.width);
+        const auto bottom = std::min<std::uint32_t>(frame.height, rect.y + rect.height);
+        if (right <= rect.x || bottom <= rect.y) {
+            continue;
+        }
+        D3D11_BOX sourceBox{};
+        sourceBox.left = rect.x;
+        sourceBox.top = rect.y;
+        sourceBox.front = 0;
+        sourceBox.right = right;
+        sourceBox.bottom = bottom;
+        sourceBox.back = 1;
+        context->CopySubresourceRegion(
+            stagingTexture,
+            0,
+            rect.x,
+            rect.y,
+            0,
+            desktopTexture,
+            0,
+            &sourceBox);
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT hr = context->Map(stagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        return Status::unavailable(hresultText(hr, "Map(stagingTexture partial)"));
+    }
+
+    const auto destinationStride = static_cast<std::size_t>(frame.width) * 4;
+    for (const auto& rect : frame.dirtyRects) {
+        const auto right = std::min<std::uint32_t>(frame.width, rect.x + rect.width);
+        const auto bottom = std::min<std::uint32_t>(frame.height, rect.y + rect.height);
+        if (right <= rect.x || bottom <= rect.y) {
+            continue;
+        }
+        const auto rowBytes = static_cast<std::size_t>(right - rect.x) * 4;
+        for (std::uint32_t y = rect.y; y < bottom; ++y) {
+            const auto* sourceRow =
+                static_cast<const std::uint8_t*>(mapped.pData) +
+                static_cast<std::size_t>(y) * mapped.RowPitch +
+                static_cast<std::size_t>(rect.x) * 4;
+            auto* destinationRow =
+                frame.bgra.data() +
+                static_cast<std::size_t>(y) * destinationStride +
+                static_cast<std::size_t>(rect.x) * 4;
+            std::memcpy(destinationRow, sourceRow, rowBytes);
+        }
+    }
+
+    context->Unmap(stagingTexture, 0);
+    return Status::ok();
 }
 
 Status startDxgiCapture(
@@ -354,6 +467,10 @@ Status startDxgiCapture(
     engine.sourceOriginX_ = outputDesc.DesktopCoordinates.left;
     engine.sourceOriginY_ = outputDesc.DesktopCoordinates.top;
     engine.dxgiCapture_ = true;
+    logInfo(
+        "host DXGI capture source " + std::to_string(sourceWidth) + "x" + std::to_string(sourceHeight) +
+        " at " + std::to_string(engine.sourceOriginX_) + "," + std::to_string(engine.sourceOriginY_) +
+        " target " + std::to_string(resolution.width) + "x" + std::to_string(resolution.height));
     (void)resolution;
     return Status::ok();
 }
@@ -487,6 +604,9 @@ Status captureGdiFrame(CaptureEngine& engine, CapturedFrame& frame) {
     frame.bgra.resize(byteCount);
     std::memcpy(frame.bgra.data(), engine.bitmapBits_, byteCount);
     frame.dirtyRectsKnown = false;
+    frame.partialCopyUsed = false;
+    frame.captureDirtyRectCount = 0;
+    frame.captureDirtyAreaPixels = 0;
     frame.dirtyRects.clear();
     engine.capturedRealFrame_ = true;
     return Status::ok();
@@ -535,6 +655,9 @@ Status captureDxgiFrame(CaptureEngine& engine, CapturedFrame& frame) {
         }
         frame = engine.latestFrame_;
         frame.dirtyRectsKnown = true;
+        frame.partialCopyUsed = false;
+        frame.captureDirtyRectCount = 0;
+        frame.captureDirtyAreaPixels = 0;
         frame.dirtyRects.clear();
         return Status::ok();
     }
@@ -554,6 +677,17 @@ Status captureDxgiFrame(CaptureEngine& engine, CapturedFrame& frame) {
     }
 
     populateDxgiDirtyRects(duplication, engine, frame);
+
+    if (shouldUsePartialDxgiCopy(engine, frame)) {
+        auto status = copyPartialDxgiFrame(context, stagingTexture, desktopTexture.Get(), frame);
+        duplication->ReleaseFrame();
+        if (!status.isOk()) {
+            return status;
+        }
+        frame.partialCopyUsed = true;
+        engine.capturedRealFrame_ = true;
+        return Status::ok();
+    }
 
     context->CopyResource(stagingTexture, desktopTexture.Get());
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -575,6 +709,7 @@ Status captureDxgiFrame(CaptureEngine& engine, CapturedFrame& frame) {
 
     context->Unmap(stagingTexture, 0);
     duplication->ReleaseFrame();
+    frame.partialCopyUsed = false;
     engine.capturedRealFrame_ = true;
     return Status::ok();
 }
