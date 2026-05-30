@@ -52,7 +52,7 @@ if(WIN32)
         host-ui/tray_app.cpp)
 
     target_compile_features(led_host_tray PRIVATE cxx_std_20)
-    target_link_libraries(led_host_tray PRIVATE shell32 user32 ws2_32)
+    target_link_libraries(led_host_tray PRIVATE shell32 user32 ws2_32 iphlpapi)
 endif()
 
 if(MSVC)

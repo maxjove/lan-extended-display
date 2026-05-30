@@ -8,6 +8,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <shellapi.h>
 
 #include <algorithm>
@@ -47,7 +48,11 @@ constexpr DWORD kDeviceOnlineTimeoutMs = 15000;
 constexpr DWORD kRecoveryFirstAttemptDelayMs = 8000;
 constexpr DWORD kRecoveryAttemptIntervalMs = 15000;
 constexpr DWORD kRecoveryOfflineProbeIntervalMs = 30000;
-constexpr DWORD kHotRestartClientReconnectDelayMs = 2000;
+constexpr std::uint16_t kHostControlPort = 17660;
+constexpr std::uint16_t kHostInputPort = 17691;
+constexpr DWORD kHostReadyTimeoutMs = 5000;
+constexpr DWORD kHotRestartClientConnectTimeoutMs = 6000;
+constexpr DWORD kHostReadyProbeIntervalMs = 100;
 constexpr int kMaxRecoveryAttempts = 120;
 constexpr const wchar_t* kWindowClassName = L"LanExtendedDisplayTrayWindow";
 constexpr const wchar_t* kSingleInstanceMutexName = L"Local\\LanExtendedDisplayTraySingleInstance";
@@ -114,6 +119,8 @@ void ensureWinsock() {
     static WinsockRuntime runtime;
     (void)runtime;
 }
+
+bool hostStillRunning();
 
 void logTray(const wchar_t* format, ...) {
     wchar_t directory[MAX_PATH]{};
@@ -354,6 +361,105 @@ bool sendUdpMessage(const std::string& targetIp, std::uint16_t port, const std::
         sizeof(target));
     closesocket(socketHandle);
     return sent == static_cast<int>(message.size());
+}
+
+bool queryHostControlTcpRow(DWORD state, const std::string& remoteIp = {}) {
+    DWORD size = 0;
+    DWORD result = GetExtendedTcpTable(
+        nullptr,
+        &size,
+        FALSE,
+        AF_INET,
+        TCP_TABLE_OWNER_PID_ALL,
+        0);
+    if (result != ERROR_INSUFFICIENT_BUFFER || size == 0) {
+        return false;
+    }
+
+    std::vector<unsigned char> buffer(size);
+    auto* table = reinterpret_cast<PMIB_TCPTABLE_OWNER_PID>(buffer.data());
+    result = GetExtendedTcpTable(
+        table,
+        &size,
+        FALSE,
+        AF_INET,
+        TCP_TABLE_OWNER_PID_ALL,
+        0);
+    if (result != NO_ERROR) {
+        logTray(L"GetExtendedTcpTable failed result=%lu", result);
+        return false;
+    }
+
+    const DWORD hostPid = g_host.started ? g_host.process.dwProcessId : 0;
+    sockaddr_in remoteAddress{};
+    bool filterRemote = false;
+    if (!remoteIp.empty() && inet_pton(AF_INET, remoteIp.c_str(), &remoteAddress.sin_addr) == 1) {
+        filterRemote = true;
+    }
+
+    for (DWORD index = 0; index < table->dwNumEntries; ++index) {
+        const auto& row = table->table[index];
+        if (row.dwState != state) {
+            continue;
+        }
+        if (hostPid != 0 && row.dwOwningPid != hostPid) {
+            continue;
+        }
+        if (ntohs(static_cast<std::uint16_t>(row.dwLocalPort)) != kHostControlPort) {
+            continue;
+        }
+        if (filterRemote && row.dwRemoteAddr != remoteAddress.sin_addr.S_un.S_addr) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+bool hostControlPortListening() {
+    return queryHostControlTcpRow(MIB_TCP_STATE_LISTEN);
+}
+
+bool hostControlClientConnected(const std::string& clientIp) {
+    return queryHostControlTcpRow(MIB_TCP_STATE_ESTAB, clientIp);
+}
+
+bool waitForHostControlReady(DWORD timeoutMs) {
+    const DWORD start = GetTickCount();
+    while (hostStillRunning()) {
+        if (hostControlPortListening()) {
+            logTray(L"host control port ready after %lu ms", GetTickCount() - start);
+            return true;
+        }
+        if (static_cast<LONG>(GetTickCount() - start - timeoutMs) >= 0) {
+            break;
+        }
+        Sleep(kHostReadyProbeIntervalMs);
+    }
+    logTray(L"host control port not ready after %lu ms", GetTickCount() - start);
+    return false;
+}
+
+bool waitForHostClientConnection(const std::string& clientIp, DWORD timeoutMs) {
+    const DWORD start = GetTickCount();
+    while (hostStillRunning()) {
+        if (hostControlClientConnected(clientIp)) {
+            logTray(
+                L"host client connection observed target=%ls after %lu ms",
+                utf8ToWide(clientIp).c_str(),
+                GetTickCount() - start);
+            return true;
+        }
+        if (static_cast<LONG>(GetTickCount() - start - timeoutMs) >= 0) {
+            break;
+        }
+        Sleep(kHostReadyProbeIntervalMs);
+    }
+    logTray(
+        L"host client connection missing target=%ls after %lu ms",
+        utf8ToWide(clientIp).c_str(),
+        GetTickCount() - start);
+    return false;
 }
 
 void rememberDevice(const std::string& address, const std::string& name, const std::string& status) {
@@ -690,7 +796,7 @@ void notifyClientToConnect(const std::string& clientIp, const char* reason = nul
     }
 
     std::ostringstream message;
-    message << "LED_CONNECT_V1;host=" << hostIp << ";control=17660;input=17691;";
+    message << "LED_CONNECT_V1;host=" << hostIp << ";control=" << kHostControlPort << ";input=" << kHostInputPort << ";";
     if (reason != nullptr && reason[0] != '\0') {
         message << "reason=" << reason << ";";
     }
@@ -701,6 +807,20 @@ void notifyClientToConnect(const std::string& clientIp, const char* reason = nul
         utf8ToWide(hostIp).c_str(),
         reason == nullptr ? L"start" : utf8ToWide(reason).c_str(),
         ok ? L"ok" : L"failed");
+}
+
+void notifyClientAfterHotRestart(const std::string& clientIp, const char* reason) {
+    if (clientIp.empty()) {
+        return;
+    }
+    if (!waitForHostControlReady(kHostReadyTimeoutMs)) {
+        logTray(L"hot restart reconnect continues although host control port is not confirmed ready");
+    }
+    notifyClientToConnect(clientIp, reason);
+    if (!waitForHostClientConnection(clientIp, kHotRestartClientConnectTimeoutMs)) {
+        logTray(L"hot restart client did not reconnect; sending retry target=%ls", utf8ToWide(clientIp).c_str());
+        notifyClientToConnect(clientIp, "restart-retry");
+    }
 }
 
 bool ensureActiveMonitorEvent() {
@@ -884,9 +1004,9 @@ bool startHost(HWND window) {
     const auto hostExe = executableDirectory() + L"\\led_host_app.exe";
     std::wstring command =
         quote(hostExe) +
-        L" --serve-mjpeg-capture 17660 17670 0 60 " +
+        L" --serve-mjpeg-capture " + std::to_wstring(kHostControlPort) + L" 17670 0 60 " +
         std::to_wstring(normalizeJpegQuality(g_jpegQuality)) +
-        L" 1920 1080 17691 sendinput keep-monitor-on-exit";
+        L" 1920 1080 " + std::to_wstring(kHostInputPort) + L" sendinput keep-monitor-on-exit";
 
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
@@ -1216,9 +1336,7 @@ void setJpegQuality(HWND window, int quality) {
         showBalloon(window, L"Quality apply failed", L"Capture did not restart. Use Stop to remove the virtual display if needed.");
         return;
     }
-    logTray(L"quality restart waiting %lu ms before client reconnect", kHotRestartClientReconnectDelayMs);
-    Sleep(kHotRestartClientReconnectDelayMs);
-    notifyClientToConnect(targetIp);
+    notifyClientAfterHotRestart(targetIp, "restart");
     logTray(L"quality restart completed");
 }
 
@@ -1249,9 +1367,7 @@ void setDiagnosticsEnabled(HWND window, bool enabled) {
         showBalloon(window, L"Diagnostics apply failed", L"Capture did not restart. Use Stop to remove the virtual display if needed.");
         return;
     }
-    logTray(L"diagnostics restart waiting %lu ms before client reconnect", kHotRestartClientReconnectDelayMs);
-    Sleep(kHotRestartClientReconnectDelayMs);
-    notifyClientToConnect(targetIp);
+    notifyClientAfterHotRestart(targetIp, "restart");
     logTray(L"diagnostics restart completed");
 }
 
