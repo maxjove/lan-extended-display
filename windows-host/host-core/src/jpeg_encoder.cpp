@@ -8,6 +8,10 @@
 #include <wrl/client.h>
 #endif
 
+#if defined(LED_HAS_TURBOJPEG)
+#include <turbojpeg.h>
+#endif
+
 #include <algorithm>
 #include <cstddef>
 #include <cwchar>
@@ -15,6 +19,63 @@
 #include <vector>
 
 namespace led::host {
+
+#if defined(LED_HAS_TURBOJPEG)
+namespace {
+
+Status encodeBgraJpegRectTurbo(
+    const CapturedFrame& frame,
+    std::uint32_t x,
+    std::uint32_t y,
+    std::uint32_t width,
+    std::uint32_t height,
+    float quality,
+    EncodedJpegFrame& encoded) {
+    tjhandle handle = tjInitCompress();
+    if (handle == nullptr) {
+        return Status::unavailable("TurboJPEG compressor initialization failed");
+    }
+
+    const auto qualityPercent = static_cast<int>(std::clamp(quality, 0.1F, 1.0F) * 100.0F);
+    const auto maxBytes = tjBufSize(static_cast<int>(width), static_cast<int>(height), TJSAMP_444);
+    if (maxBytes == 0) {
+        tjDestroy(handle);
+        return Status::unavailable("TurboJPEG buffer sizing failed");
+    }
+
+    encoded.jpegBytes.assign(maxBytes, 0);
+    auto* jpegBuffer = encoded.jpegBytes.data();
+    unsigned long jpegBytes = static_cast<unsigned long>(encoded.jpegBytes.size());
+    const auto* source = frame.bgra.data() + (static_cast<std::size_t>(y) * frame.width + x) * 4;
+    const int result = tjCompress2(
+        handle,
+        const_cast<unsigned char*>(source),
+        static_cast<int>(width),
+        static_cast<int>(frame.width * 4),
+        static_cast<int>(height),
+        TJPF_BGRA,
+        &jpegBuffer,
+        &jpegBytes,
+        TJSAMP_444,
+        qualityPercent,
+        TJFLAG_FASTDCT | TJFLAG_NOREALLOC);
+    if (result != 0) {
+        const std::string error = tjGetErrorStr2(handle) != nullptr ? tjGetErrorStr2(handle) : "unknown TurboJPEG error";
+        tjDestroy(handle);
+        return Status::unavailable("TurboJPEG encode failed: " + error);
+    }
+
+    tjDestroy(handle);
+    encoded.jpegBytes.resize(static_cast<std::size_t>(jpegBytes));
+    encoded.frameId = frame.frameId;
+    encoded.timestampUs = frame.timestampUs;
+    encoded.width = width;
+    encoded.height = height;
+    return Status::ok();
+}
+
+}  // namespace
+#endif
 
 #if defined(_WIN32)
 namespace {
@@ -230,6 +291,13 @@ Status encodeBgraJpegRect(
     (void)quality;
     return Status::unavailable("JPEG encoding is only implemented on Windows host");
 #else
+#if defined(LED_HAS_TURBOJPEG)
+    auto turboStatus = encodeBgraJpegRectTurbo(frame, x, y, width, height, quality, encoded);
+    if (turboStatus.isOk()) {
+        return Status::ok();
+    }
+#endif
+
     const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool coInitialized = SUCCEEDED(coHr);
     if (FAILED(coHr) && coHr != RPC_E_CHANGED_MODE) {
