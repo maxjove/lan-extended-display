@@ -275,6 +275,48 @@ struct MjpegLiveStats {
     std::atomic_uint64_t encodedRects{0};
 };
 
+struct MjpegLiveSnapshot {
+    std::uint64_t encodedBytes{0};
+    std::uint64_t packetsSent{0};
+    std::uint64_t fullFrames{0};
+    std::uint64_t dirtyFrames{0};
+    std::uint64_t skippedFrames{0};
+    std::uint64_t dirtyRectsSent{0};
+    std::uint64_t dirtyAreaPixels{0};
+    std::uint64_t encodeTasksDropped{0};
+    std::uint64_t captureUs{0};
+    std::uint64_t dirtyUs{0};
+    std::uint64_t encodeUs{0};
+    std::uint64_t packetizeUs{0};
+    std::uint64_t sendUs{0};
+    std::uint64_t encodedRects{0};
+    std::uint32_t capturedFrames{0};
+};
+
+MjpegLiveSnapshot snapshotMjpegLiveStats(const MjpegLiveStats& stats, std::uint32_t capturedFrames) {
+    return MjpegLiveSnapshot{
+        stats.encodedBytes.load(std::memory_order_relaxed),
+        stats.packetsSent.load(std::memory_order_relaxed),
+        stats.fullFrames.load(std::memory_order_relaxed),
+        stats.dirtyFrames.load(std::memory_order_relaxed),
+        stats.skippedFrames.load(std::memory_order_relaxed),
+        stats.dirtyRectsSent.load(std::memory_order_relaxed),
+        stats.dirtyAreaPixels.load(std::memory_order_relaxed),
+        stats.encodeTasksDropped.load(std::memory_order_relaxed),
+        stats.captureUs.load(std::memory_order_relaxed),
+        stats.dirtyUs.load(std::memory_order_relaxed),
+        stats.encodeUs.load(std::memory_order_relaxed),
+        stats.packetizeUs.load(std::memory_order_relaxed),
+        stats.sendUs.load(std::memory_order_relaxed),
+        stats.encodedRects.load(std::memory_order_relaxed),
+        capturedFrames,
+    };
+}
+
+std::uint64_t delta(std::uint64_t current, std::uint64_t previous) {
+    return current >= previous ? current - previous : 0;
+}
+
 struct DirtyRect {
     std::uint32_t x{0};
     std::uint32_t y{0};
@@ -1355,6 +1397,9 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
           led::logError(status.message());
         return 1;
     }
+    if (const auto sendBufferStatus = socket.setSendBufferBytes(4 * 1024 * 1024); !sendBufferStatus.isOk()) {
+        led::logWarn("MJPEG UDP send buffer tuning failed: " + sendBufferStatus.message());
+    }
     const auto target = led::transport::UdpEndpoint{stream.peerEndpoint().address, ready.rtpPort};
 
     std::atomic_bool stopAck{false};
@@ -1366,6 +1411,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     auto lastVideoStatsLog = nextFrameTime;
     std::uint32_t capturedFrames = 0;
     MjpegLiveStats liveStats;
+    auto previousLiveSnapshot = snapshotMjpegLiveStats(liveStats, capturedFrames);
     const float quality = std::clamp(static_cast<float>(qualityPercent) / 100.0F, 0.1F, 1.0F);
     const float idleRefreshQuality = std::max(quality, 0.85F);
     led::host::CapturedFrame previousFrame;
@@ -1646,8 +1692,11 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
         const auto now = std::chrono::steady_clock::now();
         if (diagnosticsEnabled && now - lastVideoStatsLog >= std::chrono::seconds(1)) {
             const auto [receiveAckStats, renderAckStats] = snapshotFrameAckStats(frameAckTracker);
-            const auto encodedBytes = liveStats.encodedBytes.load(std::memory_order_relaxed);
-            const auto packetsSent = liveStats.packetsSent.load(std::memory_order_relaxed);
+            const auto snapshot = snapshotMjpegLiveStats(liveStats, capturedFrames);
+            const auto windowFrames = delta(snapshot.capturedFrames, previousLiveSnapshot.capturedFrames);
+            const auto windowEncodedRects = delta(snapshot.encodedRects, previousLiveSnapshot.encodedRects);
+            const auto windowEncodedBytes = delta(snapshot.encodedBytes, previousLiveSnapshot.encodedBytes);
+            const auto windowDirtyAreaPixels = delta(snapshot.dirtyAreaPixels, previousLiveSnapshot.dirtyAreaPixels);
             const auto fullFrames = liveStats.fullFrames.load(std::memory_order_relaxed);
             const auto dirtyFrames = liveStats.dirtyFrames.load(std::memory_order_relaxed);
             const auto idleRefreshFrames = liveStats.idleRefreshFrames.load(std::memory_order_relaxed);
@@ -1657,18 +1706,17 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             const auto tileDiffFrames = liveStats.tileDiffFrames.load(std::memory_order_relaxed);
             const auto dirtyRectsSent = liveStats.dirtyRectsSent.load(std::memory_order_relaxed);
             const auto sendFailures = liveStats.sendFailures.load(std::memory_order_relaxed);
-            const auto dirtyAreaPixels = liveStats.dirtyAreaPixels.load(std::memory_order_relaxed);
             const auto encodeTasksDropped = liveStats.encodeTasksDropped.load(std::memory_order_relaxed);
-            const auto captureUs = liveStats.captureUs.load(std::memory_order_relaxed);
-            const auto dirtyUs = liveStats.dirtyUs.load(std::memory_order_relaxed);
-            const auto encodeUs = liveStats.encodeUs.load(std::memory_order_relaxed);
-            const auto packetizeUs = liveStats.packetizeUs.load(std::memory_order_relaxed);
-            const auto sendUs = liveStats.sendUs.load(std::memory_order_relaxed);
-            const auto encodedRects = liveStats.encodedRects.load(std::memory_order_relaxed);
+            const auto captureUs = snapshot.captureUs;
+            const auto dirtyUs = snapshot.dirtyUs;
+            const auto encodeUs = snapshot.encodeUs;
+            const auto packetizeUs = snapshot.packetizeUs;
+            const auto sendUs = snapshot.sendUs;
+            const auto encodedRects = snapshot.encodedRects;
             std::cout << "Host MJPEG live stats: frames=" << capturedFrames
-                      << " packets=" << packetsSent
-                      << " encoded_kb=" << (encodedBytes / 1024)
-                      << " avg_frame_kb=" << (capturedFrames == 0 ? 0 : (encodedBytes / 1024 / capturedFrames))
+                      << " packets=" << snapshot.packetsSent
+                      << " encoded_kb=" << (snapshot.encodedBytes / 1024)
+                      << " avg_frame_kb=" << (capturedFrames == 0 ? 0 : (snapshot.encodedBytes / 1024 / capturedFrames))
                       << " full=" << fullFrames
                       << " dirty=" << dirtyFrames
                       << " idle_refresh=" << idleRefreshFrames
@@ -1684,8 +1732,24 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                       << " avg_encode_ms=" << (encodedRects == 0 ? 0.0 : (static_cast<double>(encodeUs) / 1000.0 / encodedRects))
                       << " avg_packetize_ms=" << (encodedRects == 0 ? 0.0 : (static_cast<double>(packetizeUs) / 1000.0 / encodedRects))
                       << " avg_send_ms=" << (encodedRects == 0 ? 0.0 : (static_cast<double>(sendUs) / 1000.0 / encodedRects))
+                      << " win_frame_delta=" << windowFrames
+                      << " win_encoded_kb=" << (windowEncodedBytes / 1024)
+                      << " win_encode_dropped=" << delta(snapshot.encodeTasksDropped, previousLiveSnapshot.encodeTasksDropped)
+                      << " win_capture_ms=" << (windowFrames == 0 ? 0.0 :
+                          (static_cast<double>(delta(snapshot.captureUs, previousLiveSnapshot.captureUs)) / 1000.0 / windowFrames))
+                      << " win_dirty_ms=" << (windowFrames == 0 ? 0.0 :
+                          (static_cast<double>(delta(snapshot.dirtyUs, previousLiveSnapshot.dirtyUs)) / 1000.0 / windowFrames))
+                      << " win_encode_ms=" << (windowEncodedRects == 0 ? 0.0 :
+                          (static_cast<double>(delta(snapshot.encodeUs, previousLiveSnapshot.encodeUs)) / 1000.0 / windowEncodedRects))
+                      << " win_packetize_ms=" << (windowEncodedRects == 0 ? 0.0 :
+                          (static_cast<double>(delta(snapshot.packetizeUs, previousLiveSnapshot.packetizeUs)) / 1000.0 / windowEncodedRects))
+                      << " win_send_ms=" << (windowEncodedRects == 0 ? 0.0 :
+                          (static_cast<double>(delta(snapshot.sendUs, previousLiveSnapshot.sendUs)) / 1000.0 / windowEncodedRects))
+                      << " win_dirty_pct=" << (windowFrames == 0 ? 0.0 :
+                          (static_cast<double>(windowDirtyAreaPixels) * 100.0 /
+                           (static_cast<double>(windowFrames) * mode.resolution.width * mode.resolution.height)))
                       << " avg_dirty_pct=" << (capturedFrames == 0 ? 0.0 :
-                          (static_cast<double>(dirtyAreaPixels) * 100.0 /
+                          (static_cast<double>(snapshot.dirtyAreaPixels) * 100.0 /
                            (static_cast<double>(capturedFrames) * mode.resolution.width * mode.resolution.height)))
                       << " fps_target=" << actualFps
                       << " receive_ack_count=" << receiveAckStats.acks
@@ -1696,6 +1760,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                       << " render_ack_max_ms=" << (renderAckStats.maxRttUs / 1000.0)
                       << " render_ack_last_frame=" << renderAckStats.lastFrameId
                       << " ack_unknown=" << (receiveAckStats.unknownAcks + renderAckStats.unknownAcks) << '\n';
+            previousLiveSnapshot = snapshot;
             lastVideoStatsLog = now;
         }
         nextFrameTime += frameInterval;

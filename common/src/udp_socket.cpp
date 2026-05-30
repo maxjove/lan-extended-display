@@ -167,6 +167,25 @@ Status UdpSocket::setReceiveTimeoutMs(std::uint32_t timeoutMs) {
     return Status::ok();
 }
 
+Status UdpSocket::setSendBufferBytes(std::uint32_t bytes) {
+    if (!isOpen()) {
+        return Status::invalidState("cannot set send buffer on a closed UDP socket");
+    }
+
+    const int value = static_cast<int>(bytes);
+#if defined(_WIN32)
+    const auto nativeSocket = static_cast<SOCKET>(socket_);
+    if (setsockopt(nativeSocket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&value), sizeof(value)) != 0) {
+        return Status::unavailable(lastSocketError("setsockopt"));
+    }
+#else
+    if (setsockopt(socket_, SOL_SOCKET, SO_SNDBUF, &value, sizeof(value)) != 0) {
+        return Status::unavailable(lastSocketError("setsockopt"));
+    }
+#endif
+    return Status::ok();
+}
+
 Status UdpSocket::sendTo(const std::vector<std::uint8_t>& bytes, const UdpEndpoint& endpoint) const {
     if (!isOpen()) {
         return Status::invalidState("cannot send on a closed UDP socket");

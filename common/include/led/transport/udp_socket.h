@@ -27,6 +27,7 @@ public:
     Status open();
     Status bind(std::uint16_t port, const std::string& address = "0.0.0.0");
     Status setReceiveTimeoutMs(std::uint32_t timeoutMs);
+    Status setSendBufferBytes(std::uint32_t bytes);
     Status sendTo(const std::vector<std::uint8_t>& bytes, const UdpEndpoint& endpoint) const;
     Status receiveFrom(std::size_t maxBytes, std::vector<std::uint8_t>& bytes, UdpEndpoint& endpoint) const;
     void close();

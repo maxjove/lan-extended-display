@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cwchar>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,19 @@ private:
     tjhandle handle_{nullptr};
 };
 
+struct TurboJpegScratchBuffer {
+    std::unique_ptr<unsigned char[]> bytes;
+    unsigned long capacity{0};
+
+    [[nodiscard]] unsigned char* ensure(unsigned long required) {
+        if (required > capacity) {
+            bytes = std::make_unique<unsigned char[]>(required);
+            capacity = required;
+        }
+        return bytes.get();
+    }
+};
+
 Status encodeBgraJpegRectTurbo(
     const CapturedFrame& frame,
     std::uint32_t x,
@@ -61,9 +75,9 @@ Status encodeBgraJpegRectTurbo(
         return Status::unavailable("TurboJPEG buffer sizing failed");
     }
 
-    encoded.jpegBytes.resize(maxBytes);
-    auto* jpegBuffer = encoded.jpegBytes.data();
-    unsigned long jpegBytes = static_cast<unsigned long>(encoded.jpegBytes.size());
+    thread_local TurboJpegScratchBuffer scratch;
+    auto* jpegBuffer = scratch.ensure(static_cast<unsigned long>(maxBytes));
+    unsigned long jpegBytes = scratch.capacity;
     const auto* source = frame.bgra.data() + (static_cast<std::size_t>(y) * frame.width + x) * 4;
     const int result = tjCompress2(
         handle,
@@ -82,7 +96,7 @@ Status encodeBgraJpegRectTurbo(
         return Status::unavailable("TurboJPEG encode failed: " + error);
     }
 
-    encoded.jpegBytes.resize(static_cast<std::size_t>(jpegBytes));
+    encoded.jpegBytes.assign(jpegBuffer, jpegBuffer + jpegBytes);
     encoded.frameId = frame.frameId;
     encoded.timestampUs = frame.timestampUs;
     encoded.width = width;
