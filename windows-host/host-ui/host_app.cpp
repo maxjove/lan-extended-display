@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
@@ -252,6 +253,22 @@ bool frameAckTimedOut(
     return latestAck.time_since_epoch().count() != 0 && now - latestAck > timeout;
 }
 
+struct MjpegLiveStats {
+    std::atomic_uint64_t encodedBytes{0};
+    std::atomic_uint64_t packetsSent{0};
+    std::atomic_uint64_t sendFailures{0};
+    std::atomic_uint64_t dirtyFrames{0};
+    std::atomic_uint64_t fullFrames{0};
+    std::atomic_uint64_t skippedFrames{0};
+    std::atomic_uint64_t idleDiffSkippedFrames{0};
+    std::atomic_uint64_t nativeDirtyFrames{0};
+    std::atomic_uint64_t tileDiffFrames{0};
+    std::atomic_uint64_t dirtyRectsSent{0};
+    std::atomic_uint64_t idleRefreshFrames{0};
+    std::atomic_uint64_t dirtyAreaPixels{0};
+    std::atomic_uint64_t encodeTasksDropped{0};
+};
+
 struct DirtyRect {
     std::uint32_t x{0};
     std::uint32_t y{0};
@@ -462,6 +479,12 @@ DirtyRect computeDirtyRect(
 
     return dirtyRectFromBounds(current.width, current.height, minX, minY, maxX, maxY, alignPixels, fullFrameAreaRatio);
 }
+
+struct MjpegEncodeTask {
+    led::host::CapturedFrame frame;
+    std::vector<DirtyRect> dirtyRects;
+    bool idleRefresh{false};
+};
 
 std::thread startFrameAckListener(FrameAckTracker& tracker, std::atomic_bool& stop) {
     return std::thread([&tracker, &stop]() {
@@ -1330,18 +1353,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     auto nextFrameTime = std::chrono::steady_clock::now();
     auto lastVideoStatsLog = nextFrameTime;
     std::uint32_t capturedFrames = 0;
-    std::uint64_t encodedBytes = 0;
-    std::uint64_t packetsSent = 0;
-    std::uint64_t sendFailures = 0;
-    std::uint64_t dirtyFrames = 0;
-    std::uint64_t fullFrames = 0;
-    std::uint64_t skippedFrames = 0;
-    std::uint64_t idleDiffSkippedFrames = 0;
-    std::uint64_t nativeDirtyFrames = 0;
-    std::uint64_t tileDiffFrames = 0;
-    std::uint64_t dirtyRectsSent = 0;
-    std::uint64_t idleRefreshFrames = 0;
-    std::uint64_t dirtyAreaPixels = 0;
+    MjpegLiveStats liveStats;
     const float quality = std::clamp(static_cast<float>(qualityPercent) / 100.0F, 0.1F, 1.0F);
     const float idleRefreshQuality = std::max(quality, 0.85F);
     led::host::CapturedFrame previousFrame;
@@ -1351,6 +1363,9 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
     const auto idleKeyFrameInterval = std::max<std::uint32_t>(1, actualFps * 8);
     const auto idleDiffWarmupFrames = std::max<std::uint32_t>(1, actualFps / 3);
     const auto idleDiffProbeInterval = std::max<std::uint32_t>(1, actualFps / 15);
+    const auto encodeSubmitFps = std::min<std::uint32_t>(actualFps, 30);
+    const auto encodeSubmitInterval = std::chrono::microseconds(1000000 / std::max<std::uint32_t>(1, encodeSubmitFps));
+    auto nextEncodeSubmitTime = std::chrono::steady_clock::now();
     std::uint32_t idleFrames = 0;
     bool forceRecoveryFrame = false;
     auto recoverCapture = [&]() -> led::Status {
@@ -1380,6 +1395,108 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
         return status.isOk() ? led::Status::unavailable("MJPEG capture recovery timed out") : status;
     };
 
+    std::mutex encodeMutex;
+    std::condition_variable encodeCv;
+    std::optional<MjpegEncodeTask> pendingEncodeTask;
+    bool encodeStop = false;
+    std::atomic_bool encodeRecoveryFrameRequested{false};
+    led::Status encodeWorkerStatus = led::Status::ok();
+    std::mutex encodeStatusMutex;
+    std::thread encodeThread([&]() {
+        while (true) {
+            MjpegEncodeTask task;
+            {
+                std::unique_lock lock(encodeMutex);
+                encodeCv.wait(lock, [&]() { return encodeStop || pendingEncodeTask.has_value(); });
+                if (encodeStop && !pendingEncodeTask.has_value()) {
+                    break;
+                }
+                task = std::move(*pendingEncodeTask);
+                pendingEncodeTask.reset();
+            }
+
+            std::uint64_t frameEncodedBytes = 0;
+            std::uint64_t frameDirtyAreaPixels = 0;
+            bool frameHasFullRect = false;
+            for (std::size_t rectIndex = 0; rectIndex < task.dirtyRects.size(); ++rectIndex) {
+                const auto& dirty = task.dirtyRects[rectIndex];
+                if (dirty.empty) {
+                    continue;
+                }
+
+                led::host::EncodedJpegFrame jpeg;
+                auto encodeStatus = led::host::encodeBgraJpegRect(
+                    task.frame,
+                    dirty.x,
+                    dirty.y,
+                    dirty.width,
+                    dirty.height,
+                    task.idleRefresh ? idleRefreshQuality : quality,
+                    jpeg);
+                if (!encodeStatus.isOk()) {
+                    std::scoped_lock lock(encodeStatusMutex);
+                    encodeWorkerStatus = encodeStatus;
+                    break;
+                }
+
+                const auto packetFrameId = jpeg.frameId * kSubFrameIdStride + rectIndex;
+                const auto packets = led::transport::packetizeMjpegFrameRect(
+                    jpeg.jpegBytes,
+                    packetFrameId,
+                    jpeg.timestampUs,
+                    dirty.fullFrame,
+                    task.frame.width,
+                    task.frame.height,
+                    dirty.x,
+                    dirty.y,
+                    dirty.width,
+                    dirty.height,
+                    1200);
+                if (packets.empty()) {
+                    std::scoped_lock lock(encodeStatusMutex);
+                    encodeWorkerStatus = led::Status::unavailable("MJPEG packetization produced no packets");
+                    break;
+                }
+
+                noteFrameSent(frameAckTracker, packetFrameId);
+                bool sendOk = true;
+                for (const auto& packet : packets) {
+                    const auto sendStatus = socket.sendTo(packet, target);
+                    if (!sendStatus.isOk()) {
+                        sendOk = false;
+                        break;
+                    }
+                    liveStats.packetsSent.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (!sendOk) {
+                    liveStats.sendFailures.fetch_add(1, std::memory_order_relaxed);
+                    encodeRecoveryFrameRequested = true;
+                    led::logWarn("MJPEG UDP send failed, keeping session alive");
+                    break;
+                }
+
+                frameEncodedBytes += jpeg.jpegBytes.size();
+                frameDirtyAreaPixels += static_cast<std::uint64_t>(dirty.width) * dirty.height;
+                frameHasFullRect = frameHasFullRect || dirty.fullFrame;
+                liveStats.dirtyRectsSent.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            if (frameEncodedBytes == 0) {
+                continue;
+            }
+            liveStats.encodedBytes.fetch_add(frameEncodedBytes, std::memory_order_relaxed);
+            liveStats.dirtyAreaPixels.fetch_add(frameDirtyAreaPixels, std::memory_order_relaxed);
+            if (frameHasFullRect) {
+                liveStats.fullFrames.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                liveStats.dirtyFrames.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (task.idleRefresh) {
+                liveStats.idleRefreshFrames.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+
     while (!stopEvent.requested() && (frameCount == 0 || capturedFrames < frameCount)) {
         const auto loopNow = std::chrono::steady_clock::now();
         if (stream.peerClosed()) {
@@ -1391,6 +1508,18 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             status = led::Status::unavailable("MJPEG client acknowledgements timed out");
             led::logWarn(status.message());
             break;
+        }
+        {
+            std::scoped_lock lock(encodeStatusMutex);
+            if (!encodeWorkerStatus.isOk()) {
+                status = encodeWorkerStatus;
+                break;
+            }
+        }
+        if (encodeRecoveryFrameRequested.exchange(false)) {
+            previousFrame = {};
+            forceRecoveryFrame = true;
+            idleFrames = 0;
         }
 
         led::host::CapturedFrame frame;
@@ -1405,6 +1534,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
             previousFrame = {};
             forceRecoveryFrame = true;
             idleFrames = 0;
+            nextEncodeSubmitTime = std::chrono::steady_clock::now();
             nextFrameTime = std::chrono::steady_clock::now();
             continue;
         }
@@ -1425,8 +1555,8 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
         if (skipIdleDiff) {
             ++idleFrames;
             ++capturedFrames;
-            ++skippedFrames;
-            ++idleDiffSkippedFrames;
+            liveStats.skippedFrames.fetch_add(1, std::memory_order_relaxed);
+            liveStats.idleDiffSkippedFrames.fetch_add(1, std::memory_order_relaxed);
             nextFrameTime += frameInterval;
             std::this_thread::sleep_until(nextFrameTime);
             continue;
@@ -1437,9 +1567,9 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                 ? computeNativeDirtyRects(frame, 16, 0.70)
                 : std::vector<DirtyRect>{computeDirtyRect(frame, previousFrame, 16, 0.70)});
         if (!forceKeyFrame && frame.dirtyRectsKnown) {
-            ++nativeDirtyFrames;
+            liveStats.nativeDirtyFrames.fetch_add(1, std::memory_order_relaxed);
         } else if (!forceKeyFrame) {
-            ++tileDiffFrames;
+            liveStats.tileDiffFrames.fetch_add(1, std::memory_order_relaxed);
         }
         previousFrame = frame;
         bool idleRefresh = false;
@@ -1452,7 +1582,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                 idleFrames = 0;
             } else {
                 ++capturedFrames;
-                ++skippedFrames;
+                liveStats.skippedFrames.fetch_add(1, std::memory_order_relaxed);
                 nextFrameTime += frameInterval;
                 std::this_thread::sleep_until(nextFrameTime);
                 continue;
@@ -1462,93 +1592,50 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
         }
         if (dirtyRects.empty() || (dirtyRects.size() == 1 && dirtyRects.front().empty)) {
             ++capturedFrames;
-            ++skippedFrames;
+            liveStats.skippedFrames.fetch_add(1, std::memory_order_relaxed);
             nextFrameTime += frameInterval;
             std::this_thread::sleep_until(nextFrameTime);
             continue;
         }
 
-        std::uint64_t frameEncodedBytes = 0;
-        std::uint64_t frameDirtyAreaPixels = 0;
-        bool frameHasFullRect = false;
-        for (std::size_t rectIndex = 0; rectIndex < dirtyRects.size(); ++rectIndex) {
-            const auto& dirty = dirtyRects[rectIndex];
-            if (dirty.empty) {
-                continue;
-            }
-
-            led::host::EncodedJpegFrame jpeg;
-            status = led::host::encodeBgraJpegRect(
-                frame,
-                dirty.x,
-                dirty.y,
-                dirty.width,
-                dirty.height,
-                idleRefresh ? idleRefreshQuality : quality,
-                jpeg);
-            if (!status.isOk()) {
-                break;
-            }
-            const auto packetFrameId = jpeg.frameId * kSubFrameIdStride + rectIndex;
-            const auto packets = led::transport::packetizeMjpegFrameRect(
-                jpeg.jpegBytes,
-                packetFrameId,
-                jpeg.timestampUs,
-                dirty.fullFrame,
-                frame.width,
-                frame.height,
-                dirty.x,
-                dirty.y,
-                dirty.width,
-                dirty.height,
-                1200);
-            if (packets.empty()) {
-                status = led::Status::unavailable("MJPEG packetization produced no packets");
-                break;
-            }
-            noteFrameSent(frameAckTracker, packetFrameId);
-            for (const auto& packet : packets) {
-                status = socket.sendTo(packet, target);
-                if (!status.isOk()) {
-                    break;
-                }
-                ++packetsSent;
-            }
-            if (!status.isOk()) {
-                break;
-            }
-            frameEncodedBytes += jpeg.jpegBytes.size();
-            frameDirtyAreaPixels += static_cast<std::uint64_t>(dirty.width) * dirty.height;
-            frameHasFullRect = frameHasFullRect || dirty.fullFrame;
-            ++dirtyRectsSent;
-        }
-        if (!status.isOk()) {
-            ++sendFailures;
-            led::logWarn("MJPEG UDP send failed, keeping session alive: " + status.message());
-            status = led::Status::ok();
-            previousFrame = {};
-            forceRecoveryFrame = true;
-            idleFrames = 0;
-            nextFrameTime = std::chrono::steady_clock::now() + frameInterval;
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        const auto submitNow = std::chrono::steady_clock::now();
+        const bool submitImmediately = forceKeyFrame || idleRefresh || forceRecoveryFrame;
+        if (!submitImmediately && submitNow < nextEncodeSubmitTime) {
+            ++capturedFrames;
+            liveStats.skippedFrames.fetch_add(1, std::memory_order_relaxed);
+            nextFrameTime += frameInterval;
+            std::this_thread::sleep_until(nextFrameTime);
             continue;
         }
+        nextEncodeSubmitTime = submitNow + encodeSubmitInterval;
+
+        {
+            std::scoped_lock lock(encodeMutex);
+            if (pendingEncodeTask.has_value()) {
+                liveStats.encodeTasksDropped.fetch_add(1, std::memory_order_relaxed);
+            }
+            pendingEncodeTask = MjpegEncodeTask{std::move(frame), std::move(dirtyRects), idleRefresh};
+        }
+        encodeCv.notify_one();
 
         forceRecoveryFrame = false;
         ++capturedFrames;
-        encodedBytes += frameEncodedBytes;
-        dirtyAreaPixels += frameDirtyAreaPixels;
-        if (frameHasFullRect) {
-            ++fullFrames;
-        } else {
-            ++dirtyFrames;
-        }
-        if (idleRefresh) {
-            ++idleRefreshFrames;
-        }
         const auto now = std::chrono::steady_clock::now();
         if (diagnosticsEnabled && now - lastVideoStatsLog >= std::chrono::seconds(1)) {
             const auto [receiveAckStats, renderAckStats] = snapshotFrameAckStats(frameAckTracker);
+            const auto encodedBytes = liveStats.encodedBytes.load(std::memory_order_relaxed);
+            const auto packetsSent = liveStats.packetsSent.load(std::memory_order_relaxed);
+            const auto fullFrames = liveStats.fullFrames.load(std::memory_order_relaxed);
+            const auto dirtyFrames = liveStats.dirtyFrames.load(std::memory_order_relaxed);
+            const auto idleRefreshFrames = liveStats.idleRefreshFrames.load(std::memory_order_relaxed);
+            const auto skippedFrames = liveStats.skippedFrames.load(std::memory_order_relaxed);
+            const auto idleDiffSkippedFrames = liveStats.idleDiffSkippedFrames.load(std::memory_order_relaxed);
+            const auto nativeDirtyFrames = liveStats.nativeDirtyFrames.load(std::memory_order_relaxed);
+            const auto tileDiffFrames = liveStats.tileDiffFrames.load(std::memory_order_relaxed);
+            const auto dirtyRectsSent = liveStats.dirtyRectsSent.load(std::memory_order_relaxed);
+            const auto sendFailures = liveStats.sendFailures.load(std::memory_order_relaxed);
+            const auto dirtyAreaPixels = liveStats.dirtyAreaPixels.load(std::memory_order_relaxed);
+            const auto encodeTasksDropped = liveStats.encodeTasksDropped.load(std::memory_order_relaxed);
             std::cout << "Host MJPEG live stats: frames=" << capturedFrames
                       << " packets=" << packetsSent
                       << " encoded_kb=" << (encodedBytes / 1024)
@@ -1561,6 +1648,7 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
                       << " native_dirty=" << nativeDirtyFrames
                       << " tile_diff=" << tileDiffFrames
                       << " dirty_rects_sent=" << dirtyRectsSent
+                      << " encode_dropped=" << encodeTasksDropped
                       << " send_failures=" << sendFailures
                       << " avg_dirty_pct=" << (capturedFrames == 0 ? 0.0 :
                           (static_cast<double>(dirtyAreaPixels) * 100.0 /
@@ -1578,6 +1666,16 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
         }
         nextFrameTime += frameInterval;
         std::this_thread::sleep_until(nextFrameTime);
+    }
+
+    {
+        std::scoped_lock lock(encodeMutex);
+        encodeStop = true;
+        pendingEncodeTask.reset();
+    }
+    encodeCv.notify_one();
+    if (encodeThread.joinable()) {
+        encodeThread.join();
     }
 
     socket.close();
@@ -1602,6 +1700,14 @@ int runServeMjpegCaptureMode(int argc, char** argv) {
         return 1;
     }
 
+    const auto encodedBytes = liveStats.encodedBytes.load(std::memory_order_relaxed);
+    const auto packetsSent = liveStats.packetsSent.load(std::memory_order_relaxed);
+    const auto sendFailures = liveStats.sendFailures.load(std::memory_order_relaxed);
+    const auto dirtyFrames = liveStats.dirtyFrames.load(std::memory_order_relaxed);
+    const auto fullFrames = liveStats.fullFrames.load(std::memory_order_relaxed);
+    const auto idleRefreshFrames = liveStats.idleRefreshFrames.load(std::memory_order_relaxed);
+    const auto skippedFrames = liveStats.skippedFrames.load(std::memory_order_relaxed);
+    const auto dirtyRectsSent = liveStats.dirtyRectsSent.load(std::memory_order_relaxed);
     std::cout << "Client ready: " << hello.device.name
               << " peer=" << target.address << ':' << target.port << '\n';
     std::cout << "Served MJPEG capture frames=" << capturedFrames
